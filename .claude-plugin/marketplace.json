@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Fork of openai/codex-plugin-cc. Upstream is unmaintained; this carries local fixes to the review background/collection path. The plugin id stays `codex`, so /codex:* commands are unchanged.",
-    "version": "1.0.6"
+    "version": "1.0.7"
   },
   "plugins": [
     {
       "name": "codex",
       "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.6",
+      "version": "1.0.7",
       "author": {
         "name": "OpenAI"
       },
