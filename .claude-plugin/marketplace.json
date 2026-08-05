@@ -1,10 +1,10 @@
 {
-  "name": "openai-codex",
+  "name": "codex-fork",
   "owner": {
-    "name": "OpenAI"
+    "name": "OpenAI (forked by gregorydickson)"
   },
   "metadata": {
-    "description": "Codex plugins to use in Claude Code for delegation and code review.",
+    "description": "Fork of openai/codex-plugin-cc. Upstream is unmaintained; this carries local fixes to the review background/collection path. The plugin id stays `codex`, so /codex:* commands are unchanged.",
     "version": "1.0.6"
   },
   "plugins": [
