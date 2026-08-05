@@ -83,7 +83,11 @@ Collection is REQUIRED — a dispatch you never collect is a failed review, not 
 - **If `result` says `No job found`, do not conclude the run is lost — read the job record off disk.** The broker reaps records once a pid dies, but the completed result persists:
 
   ```bash
-  D="$HOME/.claude/plugins/data/codex-openai-codex/state"
+  # The data dir is <plugin>-<marketplace>, so NEVER hardcode the marketplace
+  # name -- a rename or reinstall changes it and the lookup silently finds
+  # nothing. Outside Claude Code (no CLAUDE_PLUGIN_DATA) the companion falls
+  # back to $TMPDIR/codex-companion.
+  D="$(ls -d "$HOME/.claude/plugins/data/codex-"*/state "${TMPDIR:-/tmp}/codex-companion" 2>/dev/null | head -1)"
   ls -t "$D"/*/jobs/review-*.json 2>/dev/null | head -5
   python3 -c "import json,sys; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; print(d['id'], d['status'], d['phase']); print(r.get('rawOutput',''))" <file>
   ```

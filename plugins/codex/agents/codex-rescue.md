@@ -57,7 +57,11 @@ Collection rules:
 - **If `result` says `No job found`, do not conclude the run is lost — read the job record off disk.** The broker reaps records (a dead pid drops out of `status`/`result`), but the completed result persists. Both were observed returning `No job found` for a job whose full output was sitting on disk:
 
   ```bash
-  D="$HOME/.claude/plugins/data/codex-openai-codex/state"
+  # The data dir is <plugin>-<marketplace>, so NEVER hardcode the marketplace
+  # name -- a rename or reinstall changes it and the lookup silently finds
+  # nothing. Outside Claude Code (no CLAUDE_PLUGIN_DATA) the companion falls
+  # back to $TMPDIR/codex-companion.
+  D="$(ls -d "$HOME/.claude/plugins/data/codex-"*/state "${TMPDIR:-/tmp}/codex-companion" 2>/dev/null | head -1)"
   # newest job record for this workspace:
   F="$(ls -t "$D"/*/jobs/*.json 2>/dev/null | head -20)"
   python3 -c "import json,sys; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; print(d['id'], d['status'], d['phase']); print(r.get('rawOutput',''))" <file>
