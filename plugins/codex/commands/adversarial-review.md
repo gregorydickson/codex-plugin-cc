@@ -83,11 +83,16 @@ Collection is REQUIRED — a dispatch you never collect is a failed review, not 
 - **If `result` says `No job found`, do not conclude the run is lost — read the job record off disk.** The broker reaps records once a pid dies, but the completed result persists:
 
   ```bash
-  # The data dir is <plugin>-<marketplace>, so NEVER hardcode the marketplace
-  # name -- a rename or reinstall changes it and the lookup silently finds
-  # nothing. Outside Claude Code (no CLAUDE_PLUGIN_DATA) the companion falls
-  # back to $TMPDIR/codex-companion.
-  D="$(ls -d "$HOME/.claude/plugins/data/codex-"*/state "${TMPDIR:-/tmp}/codex-companion" 2>/dev/null | head -1)"
+  # `resolveStateDir()` writes under $CLAUDE_PLUGIN_DATA/state, so that env var
+  # is authoritative -- use it directly. Do NOT hardcode the dir name (it is
+  # <plugin>-<marketplace>, so a rename or reinstall changes it), and do NOT
+  # glob-and-take-first when the env var is set: several codex-* data dirs can
+  # coexist (an inline install beside a marketplace one), and the first by sort
+  # order may belong to an unrelated install -- which would report a completed
+  # job as lost. Glob only as a last resort, then $TMPDIR (the companion's own
+  # fallback when the env var is unset, i.e. invoked outside Claude Code).
+  D="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/state}"
+  D="${D:-$(ls -d "$HOME/.claude/plugins/data/codex-"*/state "${TMPDIR:-/tmp}/codex-companion" 2>/dev/null | head -1)}"
   ls -t "$D"/*/jobs/review-*.json 2>/dev/null | head -5
   python3 -c "import json,sys; d=json.load(open(sys.argv[1])); r=d.get('result') or {}; print(d['id'], d['status'], d['phase']); print(r.get('rawOutput',''))" <file>
   ```
