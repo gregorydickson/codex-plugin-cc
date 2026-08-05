@@ -603,6 +603,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
 
 function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
   return {
+    runner: "task",
     cwd,
     model,
     effort,
@@ -610,6 +611,25 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     write,
     resumeLast,
     jobId
+  };
+}
+
+/**
+ * The stored request for a backgrounded review, mirroring `buildTaskRequest`.
+ *
+ * `runner` is the discriminator `handleTaskWorker` dispatches on. It is absent
+ * on job records written by earlier versions, so the worker treats a missing
+ * value as "task" and any already-queued job keeps running.
+ */
+function buildReviewRequest({ cwd, base, scope, model, focusText, reviewName }) {
+  return {
+    runner: "review",
+    cwd,
+    base,
+    scope,
+    model,
+    focusText,
+    reviewName
   };
 }
 
@@ -736,16 +756,33 @@ async function handleReviewCommand(argv, config) {
     jobClass: "review",
     summary: metadata.summary
   });
+  const reviewRequest = buildReviewRequest({
+    cwd,
+    base: options.base,
+    scope: options.scope,
+    model: options.model,
+    focusText,
+    reviewName: config.reviewName
+  });
+
+  // `--background` detaches a review exactly as `task --background` does.
+  // Before this branch existed the flag was PARSED and then silently ignored:
+  // every review ran in-process via runForegroundCommand, so it had no detached
+  // worker, died with its caller's shell, and could not outlive a foreground
+  // timeout. Callers were told to "check /codex:status" for a job that was
+  // never going to advance on its own.
+  if (options.background) {
+    ensureCodexAvailable(cwd);
+    const { payload } = enqueueBackgroundTask(cwd, job, reviewRequest);
+    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    return;
+  }
+
   await runForegroundCommand(
     job,
     (progress) =>
       executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: options.model,
-        focusText,
-        reviewName: config.reviewName,
+        ...reviewRequest,
         onProgress: progress
       }),
     { json: options.json }
@@ -853,8 +890,13 @@ async function handleTaskWorker(argv) {
 
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
+    throw new Error(`Stored job ${options["job-id"]} is missing its request payload.`);
   }
+
+  // Dispatch on the request's own runner rather than assuming `task`. A record
+  // written before `runner` existed has no discriminator, so absent means task
+  // and any job queued by an older version still completes.
+  const runReviewJob = request.runner === "review";
 
   const { logFile, progress } = createTrackedProgress(
     {
@@ -872,10 +914,15 @@ async function handleTaskWorker(argv) {
       logFile
     },
     () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
+      runReviewJob
+        ? executeReviewRun({
+            ...request,
+            onProgress: progress
+          })
+        : executeTaskRun({
+            ...request,
+            onProgress: progress
+          }),
     { logFile }
   );
 }
