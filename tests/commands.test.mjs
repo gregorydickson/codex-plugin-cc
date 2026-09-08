@@ -170,6 +170,20 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:cancel`/);
 });
 
+test("rescue return contract explains caller visibility and preserves recovery and no-findings cases", () => {
+  const agent = read("agents/codex-rescue.md");
+  const resultHandling = read("skills/codex-result-handling/SKILL.md");
+
+  // Pin the prompt contract, not model compliance at runtime.
+  assert.match(agent, /caller receives ONLY your final message; your transcript, tool output, and anything you printed earlier are invisible/i);
+  assert.match(agent, /"full result above\/below" delivers nothing/i);
+  assert.match(agent, /Return the Codex result verbatim in your final message/i);
+  assert.match(agent, /Both "I never fetched it" and "I fetched it and summarized" are failures/i);
+  assert.match(agent, /If the job genuinely produced no findings, say so explicitly/i);
+  assert.match(agent, /If you run out of time before the job is terminal[^\n]+Return the job id and the exact recovery command — `codex-companion\.mjs result <job-id>`/i);
+  assert.match(resultHandling, /A completion wrapper alone is not evidence of no findings; retrieve the actual result using the job id before presenting a verdict/i);
+});
+
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
   const transfer = read("commands/transfer.md");
   const result = read("commands/result.md");
