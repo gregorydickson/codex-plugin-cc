@@ -309,6 +309,8 @@ That means:
 - it uses the same local authentication state
 - it uses the same repository checkout and machine-local environment
 
+The shared app-server broker shuts down after five minutes with no connected clients. Connected tasks can run for as long as needed; the next command restarts an expired broker automatically. Set `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS` to a positive millisecond interval to change the idle timeout. Session-end hooks still shut it down immediately.
+
 ### Will it use the same Codex config I already have?
 
 Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations).

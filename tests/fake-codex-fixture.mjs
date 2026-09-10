@@ -272,7 +272,12 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+bootState.appServerPid = process.pid;
 saveState(bootState);
+if (BEHAVIOR === "ignore-shutdown") {
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+}
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {

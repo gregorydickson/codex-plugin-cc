@@ -3,9 +3,37 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { after, afterEach } from "node:test";
+import { clearBrokerSession, loadBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+const tempDirs = new Set();
+const allTempDirs = new Set();
+
+async function cleanupBrokers(dirs) {
+  for (const cwd of dirs) {
+    const session = loadBrokerSession(cwd);
+    if (session) {
+      await sendBrokerShutdown(session.endpoint);
+      teardownBrokerSession({ ...session, killProcess: terminateProcessTree });
+      clearBrokerSession(cwd);
+    }
+  }
+}
+
+afterEach(async () => {
+  await cleanupBrokers(tempDirs);
+  tempDirs.clear();
+});
+
+// A background command may finish starting its broker after its test returns.
+after(() => cleanupBrokers(allTempDirs));
 
 export function makeTempDir(prefix = "codex-plugin-test-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.add(dir);
+  allTempDirs.add(dir);
+  return dir;
 }
 
 export function writeExecutable(filePath, source) {

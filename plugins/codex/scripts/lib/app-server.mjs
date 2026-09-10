@@ -241,10 +241,11 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.readline.close();
     }
 
-    if (this.proc && !this.proc.killed) {
+    const timers = [];
+    if (this.proc && !this.exitResolved) {
       this.proc.stdin.end();
-      setTimeout(() => {
-        if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
+      timers.push(setTimeout(() => {
+        if (!this.exitResolved) {
           // On Windows with shell: true, the direct child is cmd.exe.
           // Use terminateProcessTree to kill the entire tree including
           // the grandchild node process.
@@ -259,10 +260,20 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
             this.proc.kill("SIGTERM");
           }
         }
-      }, 50).unref?.();
+      }, 50));
+      timers.push(setTimeout(() => {
+        if (!this.exitResolved && process.platform !== "win32") {
+          this.proc.kill("SIGKILL");
+        }
+      }, 1000));
+      for (const timer of timers) timer.unref?.();
     }
 
-    await this.exitPromise;
+    try {
+      await this.exitPromise;
+    } finally {
+      for (const timer of timers) clearTimeout(timer);
+    }
   }
 
   sendMessage(message) {

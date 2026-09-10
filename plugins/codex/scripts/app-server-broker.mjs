@@ -8,6 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { clearBrokerSession, loadBrokerSession } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -63,6 +64,10 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const idleTimeoutMs = Number(process.env.CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS ?? 300_000);
+  if (!Number.isInteger(idleTimeoutMs) || idleTimeoutMs <= 0 || idleTimeoutMs > 2_147_483_647) {
+    throw new Error("CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS must be a positive timer interval in milliseconds.");
+  }
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -70,6 +75,17 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  let idleTimer = null;
+  let shutdownPromise = null;
+
+  function scheduleIdleShutdown() {
+    clearTimeout(idleTimer);
+    if (sockets.size === 0 && !shutdownPromise) {
+      idleTimer = setTimeout(() => {
+        shutdown(server).then(() => process.exit(0));
+      }, idleTimeoutMs);
+    }
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -99,23 +115,37 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
-    for (const socket of sockets) {
-      socket.end();
-    }
-    await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
-    }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
-    }
+  function shutdown(server) {
+    shutdownPromise ??= (async () => {
+      clearTimeout(idleTimer);
+      const serverClosed = new Promise((resolve) => server.close(resolve));
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      await appClient.close().catch(() => {});
+      await serverClosed;
+      if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
+        fs.unlinkSync(listenTarget.path);
+      }
+      if (pidFile && fs.existsSync(pidFile)) {
+        fs.unlinkSync(pidFile);
+      }
+      const session = loadBrokerSession(cwd);
+      if (session?.pid === process.pid && session.endpoint === endpoint) {
+        clearBrokerSession(cwd);
+      }
+    })();
+    return shutdownPromise;
   }
 
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
+    if (shutdownPromise) {
+      socket.destroy();
+      return;
+    }
+    clearTimeout(idleTimer);
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
@@ -225,6 +255,7 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      scheduleIdleShutdown();
     });
 
     socket.on("error", () => {
@@ -243,7 +274,7 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  server.listen(listenTarget.path, scheduleIdleShutdown);
 }
 
 main().catch((error) => {
