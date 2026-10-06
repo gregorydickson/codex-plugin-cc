@@ -35,7 +35,7 @@ Argument handling:
 - Preserve the user's arguments exactly.
 - Do not strip `--wait` or `--background` yourself.
 - Do not add extra review instructions or rewrite the user's intent.
-- The companion script accepts `--wait` and `--background`, but `handleReviewCommand` never branches on `--background` — it always calls `runForegroundCommand`. Claude Code's `Bash(..., run_in_background: true)` is the ONLY thing that detaches the run. Unlike `task`, there is no detached worker, so the review dies with that shell: collecting it is not optional.
+- The companion script accepts `--wait` and `--background`. `--background` detaches a worker exactly as `task --background` does and returns a job id; see the background flow below. Collecting that job is not optional.
 - `/codex:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
 - If the user needs custom review instructions or more adversarial framing, they should use `/codex:adversarial-review`.
 
