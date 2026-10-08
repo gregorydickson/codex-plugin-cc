@@ -1049,8 +1049,14 @@ test("review accepts --background while still running as a tracked review job", 
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
-  assert.equal(launchPayload.review, "Review");
-  assert.match(launchPayload.codex.stdout, /No material issues found/);
+  assert.equal(launchPayload.status, "queued");
+  const waited = run("node", [SCRIPT, "status", launchPayload.jobId, "--wait", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  const collected = run("node", [SCRIPT, "result", launchPayload.jobId, "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(collected.status, 0, collected.stderr);
+  assert.equal(JSON.parse(collected.stdout).result.review, "Review");
+  assert.match(JSON.parse(collected.stdout).result.codex.stdout, /No material issues found/);
 
   const status = run("node", [SCRIPT, "status"], {
     cwd: repo,

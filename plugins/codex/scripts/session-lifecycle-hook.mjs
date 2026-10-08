@@ -4,16 +4,10 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
-import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
-import {
-  clearBrokerSession,
-  LOG_FILE_ENV,
-  loadBrokerSession,
-  PID_FILE_ENV,
-  sendBrokerShutdown,
-  teardownBrokerSession
-} from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { hasPendingJobRecovery, listJobsAcrossWorktrees, loadState, readJobFile, resolveJobFile, resolveStateFile, updateState, upsertJob, writeJobFile } from "./lib/state.mjs";
+import { withFileLockSync } from "./lib/file-lock.mjs";
+import { interruptAppServerTurn } from "./lib/codex.mjs";
+import { finalizeTrackedJob } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -39,38 +33,56 @@ function appendEnvVar(name, value) {
   fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
 }
 
-function cleanupSessionJobs(cwd, sessionId) {
+async function cleanupSessionJobs(cwd, sessionId) {
   if (!cwd || !sessionId) {
     return;
   }
 
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const roots = new Set(listJobsAcrossWorktrees(resolveWorkspaceRoot(cwd)).map(job => job.workspaceRoot));
+  for (const root of roots) await cleanupWorkspaceJobs(root, sessionId);
+}
+
+async function cleanupWorkspaceJobs(workspaceRoot, sessionId) {
   const stateFile = resolveStateFile(workspaceRoot);
   if (!fs.existsSync(stateFile)) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
-    return;
-  }
-
-  for (const job of removedJobs) {
-    const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
-      continue;
+  const owned = (job) => job.sessionId === sessionId && !job.persistent && !job.name;
+  const removed = loadState(workspaceRoot).jobs.filter(owned);
+  for (const job of removed) {
+    if (!["queued", "running", "awaiting-answer"].includes(job.status)) continue;
+    if (fs.existsSync(resolveJobFile(workspaceRoot, job.id))) {
+      const current = withFileLockSync(`${resolveJobFile(workspaceRoot, job.id)}.lock`, () => {
+        const file = resolveJobFile(workspaceRoot, job.id);
+        if (!fs.existsSync(file)) return null;
+        const latest = { ...job, ...readJobFile(file) };
+        if (!owned(latest) || !["queued", "running", "awaiting-answer"].includes(latest.status)) return null;
+        const requested = { ...latest, cancelRequested: true };
+        writeJobFile(workspaceRoot, job.id, requested); upsertJob(workspaceRoot, requested);
+        return requested;
+      }, { timeoutMs: 45000 });
+      if (!current) continue;
+      if (current.status === "running") {
+        await interruptAppServerTurn(workspaceRoot, { threadId: current.threadId, turnId: current.turnId });
+      }
+      await finalizeTrackedJob(workspaceRoot, job.id, { status: "cancelled" }, {
+        beforeTransition(current) {
+          if (!["queued", "running"].includes(current.status)) return;
+          try {
+            terminateProcessTree(current.pid ?? current.workerPid ?? Number.NaN);
+          } catch {
+            // Finalization still releases locks when a worker has already exited.
+          }
+        }
+      });
+    } else if (["queued", "running"].includes(job.status)) {
+      try { terminateProcessTree(job.pid ?? job.workerPid ?? Number.NaN); } catch {}
     }
-    try {
-      terminateProcessTree(job.pid ?? Number.NaN);
-    } catch {
-      // Ignore teardown failures during session shutdown.
-    }
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+  const removedIds = new Set(removed.map((job) => job.id));
+  updateState(workspaceRoot, (state) => {
+    state.jobs = state.jobs.filter((job) => !removedIds.has(job.id) || !owned(job) || hasPendingJobRecovery(job));
   });
 }
 
@@ -82,35 +94,9 @@ function handleSessionStart(input) {
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
-  const brokerSession =
-    loadBrokerSession(cwd) ??
-    (process.env[BROKER_ENDPOINT_ENV]
-      ? {
-          endpoint: process.env[BROKER_ENDPOINT_ENV],
-          pidFile: process.env[PID_FILE_ENV] ?? null,
-          logFile: process.env[LOG_FILE_ENV] ?? null
-        }
-      : null);
-  const brokerEndpoint = brokerSession?.endpoint ?? null;
-  const pidFile = brokerSession?.pidFile ?? null;
-  const logFile = brokerSession?.logFile ?? null;
-  const sessionDir = brokerSession?.sessionDir ?? null;
-  const pid = brokerSession?.pid ?? null;
-
-  if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
-  }
-
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
-  teardownBrokerSession({
-    endpoint: brokerEndpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid,
-    killProcess: terminateProcessTree
-  });
-  clearBrokerSession(cwd);
+  // The broker belongs to the workspace, not to this Claude session. Other
+  // sessions and persistent jobs may still use it; its idle timer owns shutdown.
+  await cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
 }
 
 async function main() {

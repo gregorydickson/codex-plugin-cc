@@ -2,8 +2,9 @@
 
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
-This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
-they already have.
+This fork of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) adds
+orchestration workers and shared-broker reliability fixes while keeping the existing
+Claude Code review and delegation workflow.
 
 <video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
 
@@ -12,6 +13,7 @@ they already have.
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
 - `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- [`codex:codex-worker`](#orchestrating-codex-workers) for schema-validated background workers, persistent sessions, steering, and lifecycle collection
 
 ## Requirements
 
@@ -24,13 +26,13 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add gregorydickson/codex-plugin-cc
 ```
 
 Install the plugin:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin install codex@codex-fork
 ```
 
 Reload plugins:
@@ -62,7 +64,7 @@ If Codex is installed but not logged in yet, run:
 After install, you should see:
 
 - the slash commands listed below
-- the `codex:codex-rescue` subagent in `/agents`
+- the `codex:codex-rescue` and `codex:codex-worker` subagents in `/agents`
 
 One simple first run is:
 
@@ -309,7 +311,7 @@ That means:
 - it uses the same local authentication state
 - it uses the same repository checkout and machine-local environment
 
-The shared app-server broker shuts down after five minutes with no connected clients. Connected tasks can run for as long as needed; the next command restarts an expired broker automatically. Set `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS` to a positive millisecond interval to change the idle timeout. Session-end hooks still shut it down immediately.
+The shared app-server broker shuts down after five minutes with no connected clients. Connected tasks can run for as long as needed; the next command restarts an expired broker automatically. Set `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS` to a positive millisecond interval to change the idle timeout. Session-end hooks leave the shared broker running so other sessions can continue using it.
 
 ### Will it use the same Codex config I already have?
 
@@ -320,3 +322,111 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+## Orchestrating Codex workers
+
+This fork adds an opt-in worker interface for orchestrators. Use the
+[`codex:codex-worker` subagent](plugins/codex/agents/codex-worker.md) when you want to
+delegate a brief and receive a validated JSON result envelope, or call the companion
+CLI directly for control over worker sessions and lifecycle events. These options
+are exposed by the companion CLI; they are not automatically available on every
+slash command.
+
+| Capability | What it provides |
+| --- | --- |
+| Structured results | `--output-schema` validates task and review output; `--result-file` writes a JSON envelope with status and validation diagnostics. |
+| Explicit context | `--brief`, repeated `--instructions`, and repeated `--preread` attach the task and supporting files. |
+| Model and runtime selection | Per-call `--model`, `--effort`, `--profile`, and `--mcp-config` select worker configuration. |
+| Persistent sessions | `--name` or `--persistent` lets a worker outlive the calling Claude session; `sessions` lists, resumes, and stops named work. |
+| Steering and questions | `send` steers an active turn; `--pause-and-ask` and `answer` let an orchestrator resolve a blocked worker's question. |
+| Controlled writes | `--write --worktree` selects a Git worktree, with optional external lock/unlock commands and `changedFiles` reporting. |
+| Lifecycle collection | Result files, Unix socket notifications, shell hooks, and a detached watchdog support collecting background work. |
+| Comparison and verification | `compare` compares schema-valid peer results; `verify-claims` checks claims against source at a pinned Git revision. |
+| Usage and fan-out | Token usage, quota-exhaustion errors, and `--fanout N` with cumulative child limits and completed child results expose supported Codex child-worker behavior. |
+
+### Start a typed background worker
+
+Set `C` to the companion's absolute path. From a clone of this repository:
+
+```sh
+C="$(pwd)/plugins/codex/scripts/codex-companion.mjs"
+```
+
+Inside an installed plugin's execution environment, use
+`C="${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs"` instead. Run the following
+commands from the project you want Codex to inspect:
+
+```sh
+cat > brief.md <<'BRIEF'
+Inspect this project's error handling without changing files.
+Return a concise summary and a list of concrete findings.
+BRIEF
+
+cat > result.schema.json <<'SCHEMA'
+{
+  "type": "object",
+  "properties": {
+    "summary": { "type": "string" },
+    "findings": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["summary", "findings"],
+  "additionalProperties": false
+}
+SCHEMA
+
+node "$C" task --background --name audit --brief brief.md \
+  --output-schema result.schema.json --result-file /tmp/audit-result.json --json
+```
+
+Replace `JOB_ID` below with the `jobId` returned by the launch command:
+
+```sh
+node "$C" status JOB_ID --wait --json
+node "$C" result JOB_ID --json
+```
+
+A bounded wait can return while the worker is still running; repeat it as needed.
+Treat the result as successful only when `status` is `completed` and `schemaValid`
+is `true`. The envelope preserves invalid-output diagnostics and includes runtime
+metadata such as `changedFiles`, `children`, and usage when available.
+
+### Coordinate ongoing work
+
+```sh
+node "$C" sessions list --json
+node "$C" send audit "Also inspect the empty-input case" --json
+node "$C" sessions resume audit "Expand the completed review to cover retries" --background --json
+```
+
+`send` requires an active turn. Resuming a completed named session returns a new
+job ID on the same Codex thread. A worker launched with `--pause-and-ask` can return
+an `awaiting-answer` report; continue it with
+`node "$C" answer JOB_ID "Your decision" --json` while retaining its job ID.
+
+### Reliability and current limits
+
+Concurrent callers now serialize shared broker startup. Ending one Claude session
+leaves the shared broker available to other sessions, and the broker still reaps
+itself after its idle timeout.
+
+Terminal notifications and lock cleanup recover from process crashes. Replayed
+terminal events carry a stable `deliveryId` (`CODEX_JOB_DELIVERY_ID` for hooks);
+consumers must deduplicate that ID atomically with their side effect. External lock
+commands must use the supplied ownership token and support idempotent release and
+cancellation of pending acquisition. See the guide for the complete lock contract.
+Progress notifications are best effort and coalesced; keep a result file for collection.
+
+Snapshots run inside each lock segment and accumulate across pause/answer. Explicit
+worktree accounting fails when its 10,000-entry / 64 MiB content budget is exceeded.
+Comparison peer output has a combined 1 MiB stdout/stderr limit.
+
+Private job state retains resolved configuration for resumption; protect that directory.
+Public status/session output excludes that configuration and executable commands.
+Profile network allowlists cover sandboxed command traffic, not hosted web tools,
+apps, or MCP server networking. MCP availability, network policy enforcement, and
+child-worker support depend on the installed Codex runtime. Parent token usage does
+not include child usage or estimate dollar cost.
+
+See the [worker CLI guide](plugins/codex/docs/workers.md) for configuration formats,
+notification events, worktree locking, comparison inputs, claim verification, and
+runtime requirements.

@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { withFileLockSync, writeJsonAtomic } from "./file-lock.mjs";
+import { runCommand } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -52,7 +54,7 @@ export function resolveJobsDir(cwd) {
 }
 
 export function ensureStateDir(cwd) {
-  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
+  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true, mode: 0o700 });
 }
 
 export function loadState(cwd) {
@@ -77,10 +79,17 @@ export function loadState(cwd) {
   }
 }
 
+export function hasPendingJobRecovery(job) {
+  return Boolean(job.finalization || (job.terminalDelivery && !job.terminalDelivery.delivered) || job.lockAcquired || (job.externalLock && job.externalLock.state !== "released"));
+}
+
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const sorted = [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+  let historyCount = 0;
+  return sorted.filter((job) => {
+    if (hasPendingJobRecovery(job) || job.persistent || job.name || ["queued", "running", "awaiting-answer"].includes(job.status)) return true;
+    return historyCount++ < MAX_JOBS;
+  });
 }
 
 function removeFileIfExists(filePath) {
@@ -90,6 +99,10 @@ function removeFileIfExists(filePath) {
 }
 
 export function saveState(cwd, state) {
+  return withFileLockSync(path.join(resolveStateDir(cwd), "state.lock"), () => saveStateUnlocked(cwd, state));
+}
+
+function saveStateUnlocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
@@ -111,14 +124,16 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeJsonAtomic(resolveStateFile(cwd), nextState);
   return nextState;
 }
 
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withFileLockSync(path.join(resolveStateDir(cwd), "state.lock"), () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateUnlocked(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {
@@ -150,6 +165,15 @@ export function listJobs(cwd) {
   return loadState(cwd).jobs;
 }
 
+export function listJobsAcrossWorktrees(cwd) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const result = runCommand("git", ["worktree", "list", "--porcelain", "-z"], { cwd: workspaceRoot, shell: false });
+  const roots = result.status === 0 && !result.error
+    ? result.stdout.split("\0").filter((field) => field.startsWith("worktree ")).map((field) => field.slice(9))
+    : [workspaceRoot];
+  return [...new Set(roots)].flatMap((root) => listJobs(root).map((job) => ({ ...job, workspaceRoot: root })));
+}
+
 export function setConfig(cwd, key, value) {
   return updateState(cwd, (state) => {
     state.config = {
@@ -166,7 +190,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeJsonAtomic(jobFile, payload);
   return jobFile;
 }
 

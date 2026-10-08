@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { resolveStateDir } from "./state.mjs";
+import { withFileLock, writeJsonAtomic } from "./file-lock.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -92,7 +93,7 @@ export function loadBrokerSession(cwd) {
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  writeJsonAtomic(resolveBrokerStateFile(cwd), session);
 }
 
 export function clearBrokerSession(cwd) {
@@ -100,6 +101,13 @@ export function clearBrokerSession(cwd) {
   if (fs.existsSync(stateFile)) {
     fs.unlinkSync(stateFile);
   }
+}
+
+export async function clearOwnedBrokerSession(cwd, { pid, endpoint }) {
+  return withFileLock(path.join(resolveStateDir(cwd), "broker.lock"), () => {
+    const current = loadBrokerSession(cwd);
+    if (current?.pid === pid && current.endpoint === endpoint) clearBrokerSession(cwd);
+  });
 }
 
 async function isBrokerEndpointReady(endpoint) {
@@ -114,6 +122,12 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  return withFileLock(path.join(resolveStateDir(cwd), "broker.lock"), () => startBrokerSession(cwd, options), {
+    timeoutMs: options.lockTimeoutMs ?? Math.max(15000, (options.timeoutMs ?? 2000) + 5000)
+  });
+}
+
+async function startBrokerSession(cwd, options) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, listJobs, listJobsAcrossWorktrees, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -18,7 +18,7 @@ function getCurrentSessionId(options = {}) {
 
 function filterJobsForCurrentSession(jobs, options = {}) {
   const sessionId = getCurrentSessionId(options);
-  if (!sessionId) {
+  if (!sessionId || options.allSessions) {
     return jobs;
   }
   return jobs.filter((job) => job.sessionId === sessionId);
@@ -158,10 +158,21 @@ function inferLegacyJobPhase(job, progressPreview = []) {
   return job.jobClass === "review" ? "reviewing" : "running";
 }
 
+// Public records are deliberately allowlisted: stored jobs retain runtime secrets for resume.
+export function publicJob(job) {
+  if (!job) return null;
+  const fields = ["id", "name", "sessionId", "workspaceRoot", "kind", "kindLabel", "jobClass",
+    "status", "phase", "title", "summary", "threadId", "turnId", "createdAt", "updatedAt",
+    "startedAt", "completedAt", "cancelledAt", "persistent", "write", "model", "effort",
+    "logFile", "resultFile", "worktree", "resumedFrom", "resumedTo", "previousName",
+    "schemaValid", "changedFiles", "errorCode", "errorMessage", "retryAfter"];
+  return Object.fromEntries(fields.filter(key => job[key] !== undefined).map(key => [key, job[key]]));
+}
+
 export function enrichJob(job, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
   const enriched = {
-    ...job,
+    ...publicJob(job),
     kindLabel: getJobTypeLabel(job),
     progressPreview:
       job.status === "queued" || job.status === "running" || job.status === "failed"
@@ -169,7 +180,7 @@ export function enrichJob(job, options = {}) {
         : [],
     elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? null),
     duration:
-      job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+      job.status === "completed" || job.status === "failed" || job.status === "cancelled" || job.status === "orphaned" || job.status === "awaiting-answer"
         ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
         : null
   };
@@ -195,9 +206,10 @@ function matchJobReference(jobs, reference, predicate = () => true) {
   }
 
   const exact = filtered.find((job) => job.id === reference);
-  if (exact) {
-    return exact;
-  }
+  if (exact) return exact;
+  const named = filtered.filter((job) => job.name === reference);
+  if (named.length === 1) return named[0];
+  if (named.length > 1) throw new Error(`Session name "${reference}" is ambiguous. Use a job id.`);
 
   const prefixMatches = filtered.filter((job) => job.id.startsWith(reference));
   if (prefixMatches.length === 1) {
@@ -213,7 +225,7 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(options.allSessions ? listJobsAcrossWorktrees(workspaceRoot) : listJobs(workspaceRoot), options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -240,30 +252,31 @@ export function buildStatusSnapshot(cwd, options = {}) {
 }
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const selected = matchJobReference(jobs, reference);
+  const workspaceRoot = options.target?.workspaceRoot ?? resolveWorkspaceRoot(cwd);
+  const selected = options.target
+    ? readStoredJob(options.target.workspaceRoot, options.target.id)
+    : matchJobReference(sortJobsNewestFirst(listJobsAcrossWorktrees(workspaceRoot)), reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
   }
 
   return {
-    workspaceRoot,
+    workspaceRoot: selected.workspaceRoot ?? options.target?.workspaceRoot ?? workspaceRoot,
     job: enrichJob(selected, { maxProgressLines: options.maxProgressLines })
   };
 }
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
+  const jobs = sortJobsNewestFirst(reference ? listJobsAcrossWorktrees(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
   const selected = matchJobReference(
     jobs,
     reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled" || job.status === "orphaned" || job.status === "awaiting-answer"
   );
 
   if (selected) {
-    return { workspaceRoot, job: selected };
+    return { workspaceRoot: selected.workspaceRoot ?? workspaceRoot, job: selected };
   }
 
   const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");
@@ -280,21 +293,21 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
+  const jobs = sortJobsNewestFirst(listJobsAcrossWorktrees(workspaceRoot));
+  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running" || job.status === "awaiting-answer");
 
   if (reference) {
     const selected = matchJobReference(activeJobs, reference);
     if (!selected) {
       throw new Error(`No active job found for "${reference}".`);
     }
-    return { workspaceRoot, job: selected };
+    return { workspaceRoot: selected.workspaceRoot ?? workspaceRoot, job: selected };
   }
 
   const sessionScopedActiveJobs = filterJobsForCurrentSession(activeJobs, options);
 
   if (sessionScopedActiveJobs.length === 1) {
-    return { workspaceRoot, job: sessionScopedActiveJobs[0] };
+    return { workspaceRoot: sessionScopedActiveJobs[0].workspaceRoot ?? workspaceRoot, job: sessionScopedActiveJobs[0] };
   }
   if (sessionScopedActiveJobs.length > 1) {
     throw new Error("Multiple Codex jobs are active. Pass a job id to /codex:cancel.");

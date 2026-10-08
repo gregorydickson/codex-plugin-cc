@@ -26,6 +26,8 @@ import type {
   TurnInterruptResponse,
   TurnStartParams,
   TurnStartResponse,
+  TurnSteerParams,
+  TurnSteerResponse,
   UserInput
 } from "../../.generated/app-server-types/v2/index.js";
 
@@ -65,6 +67,7 @@ export interface AppServerMethodMap {
   "thread/list": { params: ThreadListParams; result: ThreadListResponse };
   "review/start": { params: ReviewStartParams; result: ReviewStartResponse };
   "turn/start": { params: TurnStartParams; result: TurnStartResponse };
+  "turn/steer": { params: TurnSteerParams; result: TurnSteerResponse };
   "turn/interrupt": { params: TurnInterruptParams; result: TurnInterruptResponse };
 }
 
