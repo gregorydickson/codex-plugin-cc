@@ -1,19 +1,50 @@
 # Codex plugin for Claude Code
 
-Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
+**Delegate to Codex workers that return structured results, keep context across
+sessions, ask for decisions, and participate in coordinated agent workflows.**
 
-This fork of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) adds
-orchestration workers and shared-broker reliability fixes while keeping the existing
-Claude Code review and delegation workflow.
+This is an enhanced fork of
+[openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc). It retains the
+original Claude Code review and delegation commands and adds an orchestration
+interface for Claude or another controller to manage Codex workers.
 
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
+## What this fork adds—and what it enables
 
-## What You Get
+| Our enhancement | Practical implication |
+| --- | --- |
+| **Schema-validated results and explicit task context** | Give each worker a brief, instructions, and source files; collect a predictable JSON result that a controller can check and pass to the next stage. |
+| **Persistent named workers, live steering, and pause/answer** | Keep an investigation across Claude sessions, redirect an active worker, or resolve a blocked decision while retaining its Codex thread. |
+| **Worktree targeting, external lock coordination, and changed-file reporting** | Assign implementation work to separate worktrees and inspect each worker's changes. Cooperating token-aware locks also let writers coordinate access to a shared worktree. |
+| **Child-worker fanout with cumulative limits and completion checks** | Delegate several investigations within a task and require completed child results. Replacement and nested children count toward the requested limit. |
+| **Structured comparison and source-pinned claim verification** | Compare Codex with another reviewer, locate disagreements, and check claims against a specific source revision before acting on them. |
+| **Per-worker model, effort, profile, and MCP configuration** | Give different roles different runtime settings and selected tools, with configuration metadata included in their results. |
+| **Shared-broker fixes, crash recovery, and durable terminal events** | Concurrent callers can share Codex without racing broker startup or ending each other's connection at session exit. Controllers can recover job outcomes and retry event delivery after a worker crash. |
+
+**Together, these additions let you build a workflow such as parallel investigation
+→ implementation in a dedicated worktree → independent review → a controller's
+decision to publish.** Named workers can continue when the calling session ends;
+result files and lifecycle events let the controller collect their outcomes later.
+
+The plugin supplies the worker interface; your controller assigns responsibilities,
+checks evidence, runs tests, and decides what to merge. Schema validity does not
+prove correctness, and fanout limits are not token budgets. Crash-safe external
+effects require the documented lock-token and event-deduplication contracts.
+
+Start with the [`codex:codex-worker` subagent or companion CLI](#orchestrating-codex-workers).
+See [example workflows](#what-this-enables), the
+[worker quickstart](#start-a-typed-background-worker), and
+[reliability limits](#reliability-and-current-limits).
+Worker options are exposed through the companion CLI; they are not automatically
+available on every slash command.
+
+## Review and delegation commands
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
 - `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
 - [`codex:codex-worker`](#orchestrating-codex-workers) for schema-validated background workers, persistent sessions, steering, and lifecycle collection
+
+<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
 
 ## Requirements
 
