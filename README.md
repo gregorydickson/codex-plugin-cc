@@ -332,6 +332,57 @@ CLI directly for control over worker sessions and lifecycle events. These option
 are exposed by the companion CLI; they are not automatically available on every
 slash command.
 
+### What this enables
+
+The worker interface lets Claude or another controller delegate a bounded piece
+of work, continue with other tasks, and collect a result it can process. The
+controller can distinguish a completed result from a question, invalid output,
+or a failed worker without interpreting a conversational transcript.
+
+| Workflow | How the improvements help | What the controller still owns |
+| --- | --- | --- |
+| Review from several perspectives | Give security, correctness, and test reviewers separate briefs, then collect structured findings. Use separate workers or supported `--fanout` delegation. | Assign distinct responsibilities, reconcile duplicate or conflicting findings, and check the evidence. |
+| Fix independent tickets in parallel | Give each writer its own Git worktree and inspect its `changedFiles` alongside the result. Token-aware external locks can coordinate writers that share a worktree. | Create worktrees, enforce ownership, run checks, resolve conflicts, and decide what to merge. |
+| Keep an investigation across sessions | Name a background audit, leave the calling session, then inspect or resume its Codex thread later. | Collect each job's result and explicitly stop work that is no longer needed. |
+| Ask for a decision without losing context | A worker can pause with a question, proposed answer, and source references; `answer` continues the same job and thread. | Route the question to a person or another agent and supply the decision. |
+| Check competing conclusions | `compare` exposes field disagreements between Codex and a supplied peer; `verify-claims` checks statements against a pinned source revision. | Investigate disagreements and assess the verifier's evidence. Agreement alone does not establish correctness. |
+| Drive a dashboard or follow-up stage | Result files provide durable collection, while socket events and hooks can notify a controller that work needs attention. | Implement the listener, deduplicate replayed terminal events, and decide whether to retry, escalate, or launch the next stage. |
+
+These are building blocks for a workflow you define. The plugin does not
+automatically create a ticket queue, assign an agent team, approve changes, or
+merge pull requests. A valid JSON schema establishes the shape of a result;
+tests and source evidence are still needed to establish that its conclusions are
+correct.
+
+### Example: investigate, implement, and verify a fix
+
+For a bug spanning two components, a controller could start two read-only
+investigators with the same bug report and different source files to inspect.
+Each returns a structured hypothesis and supporting references. The controller
+compares the findings, resolves any open question, and gives an implementation
+worker a focused brief in a dedicated worktree. A separate reviewer then checks
+the resulting diff and test evidence before the controller decides whether to
+publish it.
+
+```mermaid
+flowchart LR
+    Brief[Bug report] --> A[Investigate component A]
+    Brief --> B[Investigate component B]
+    A --> S[Controller checks evidence]
+    B --> S
+    S --> W[Implement in a worktree]
+    W --> V[Review diff and run tests]
+    V --> D[Controller decides next step]
+```
+
+If the implementation worker needs a product decision, `--pause-and-ask` gives
+the controller an explicit handoff point. If it crashes, recovery records a
+terminal outcome and attempts cleanup so the controller can inspect the work
+before choosing a retry; recovery does not finish the task automatically.
+Keeping a result file means a missed progress event need not lose the outcome.
+
+### Worker capabilities
+
 | Capability | What it provides |
 | --- | --- |
 | Structured results | `--output-schema` validates task and review output; `--result-file` writes a JSON envelope with status and validation diagnostics. |
