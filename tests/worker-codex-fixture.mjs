@@ -10,7 +10,9 @@ export function installWorkerCodex(binDir, behavior = "review-ok") {
   if (start < 0 || end < 0) throw new Error("Fixture payload anchor not found");
   const payload = `        const paused = prompt.includes("NEED_ANSWER") && !prompt.includes("Answer to your stop report:");
         const wrapped = message.params.outputSchema?.properties?.state?.enum && message.params.outputSchema?.properties?.result;
-        const payload = wrapped
+        const payload = message.params.outputSchema?.properties?.evidence
+          ? JSON.stringify({ verdict: BEHAVIOR === "invalid-claim-verdict" ? "maybe" : "holds", evidence: "source.txt:1@pinned" })
+          : wrapped
           ? JSON.stringify({ state: paused ? "awaiting-answer" : "completed", result: paused ? null : { count: 2 }, question: paused ? "Which option?" : null, draftAnswer: paused ? "yes" : null, facts: [], itemsHeld: [] })
           : paused ? JSON.stringify({ question: "Which option?", draftAnswer: "yes", facts: [], itemsHeld: [], state: "awaiting-answer" }) : JSON.stringify({ count: 2 });`;
 

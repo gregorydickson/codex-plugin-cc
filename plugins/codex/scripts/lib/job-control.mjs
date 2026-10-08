@@ -158,10 +158,21 @@ function inferLegacyJobPhase(job, progressPreview = []) {
   return job.jobClass === "review" ? "reviewing" : "running";
 }
 
+// Public records are deliberately allowlisted: stored jobs retain runtime secrets for resume.
+export function publicJob(job) {
+  if (!job) return null;
+  const fields = ["id", "name", "sessionId", "workspaceRoot", "kind", "kindLabel", "jobClass",
+    "status", "phase", "title", "summary", "threadId", "turnId", "createdAt", "updatedAt",
+    "startedAt", "completedAt", "cancelledAt", "persistent", "write", "model", "effort",
+    "logFile", "resultFile", "worktree", "resumedFrom", "resumedTo", "previousName",
+    "schemaValid", "changedFiles", "errorCode", "errorMessage", "retryAfter"];
+  return Object.fromEntries(fields.filter(key => job[key] !== undefined).map(key => [key, job[key]]));
+}
+
 export function enrichJob(job, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
   const enriched = {
-    ...job,
+    ...publicJob(job),
     kindLabel: getJobTypeLabel(job),
     progressPreview:
       job.status === "queued" || job.status === "running" || job.status === "failed"
@@ -241,15 +252,16 @@ export function buildStatusSnapshot(cwd, options = {}) {
 }
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobsAcrossWorktrees(workspaceRoot));
-  const selected = matchJobReference(jobs, reference);
+  const workspaceRoot = options.target?.workspaceRoot ?? resolveWorkspaceRoot(cwd);
+  const selected = options.target
+    ? readStoredJob(options.target.workspaceRoot, options.target.id)
+    : matchJobReference(sortJobsNewestFirst(listJobsAcrossWorktrees(workspaceRoot)), reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
   }
 
   return {
-    workspaceRoot: selected.workspaceRoot ?? workspaceRoot,
+    workspaceRoot: selected.workspaceRoot ?? options.target?.workspaceRoot ?? workspaceRoot,
     job: enrichJob(selected, { maxProgressLines: options.maxProgressLines })
   };
 }

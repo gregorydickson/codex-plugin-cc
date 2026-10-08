@@ -9,6 +9,13 @@ import { resultEnvelope } from "../plugins/codex/scripts/lib/job-results.mjs";
 import { writeJobFile, upsertJob, readJobFile, resolveJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { validateWorktree } from "../plugins/codex/scripts/lib/worktree-jobs.mjs";
 
+function cleanupWatchdog(t, workspaceRoot, jobId) {
+  t.after(() => {
+    const pid = readJobFile(resolveJobFile(workspaceRoot, jobId)).watchdogPid;
+    if (pid) { try { process.kill(pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw error; } }
+  });
+}
+
 const schema = { type: "object", required: ["count"], properties: { count: { type: "integer", minimum: 1 } }, additionalProperties: false };
 
 test("typed envelope preserves invalid raw output and enforces schema constraints", () => {
@@ -42,7 +49,7 @@ test("cancel wins late completion; result, socket and end hook run once", async 
   } finally { await new Promise(resolve => server.close(resolve)); }
 });
 
-test("worktree run reports shell changes including previously dirty files and unlocks failure", async () => {
+test("worktree run reports shell changes including previously dirty files and unlocks failure", async t => {
   const workspaceRoot = makeTempDir(); initGitRepo(workspaceRoot);
   fs.writeFileSync(path.join(workspaceRoot, "b"), "original");
   run("git", ["add", "."], { cwd: workspaceRoot }); run("git", ["commit", "-m", "initial"], { cwd: workspaceRoot });
@@ -51,6 +58,7 @@ test("worktree run reports shell changes including previously dirty files and un
   const nested = path.join(workspaceRoot, "nested"); fs.mkdirSync(nested);
   assert.throws(() => validateWorktree(nested), /root/);
   const lock = path.join(workspaceRoot, "lock");
+  cleanupWatchdog(t, workspaceRoot, "write");
   const job = { id: "write", workspaceRoot, worktree: workspaceRoot, structured: true, lockCmd: `touch '${lock}'`, unlockCmd: `rm '${lock}'` };
   await assert.rejects(runTrackedJob(job, async () => {
     fs.writeFileSync(path.join(workspaceRoot, "a"), "new");
@@ -74,17 +82,21 @@ test("dead workers reconcile into orphaned result and fail hook", async () => {
 
 test("pause-and-ask retains thread and does not fire terminal hook", async () => {
   const workspaceRoot = makeTempDir();
-  const job = { id: "question", workspaceRoot, pauseAndAsk: true };
+  const hookFile = path.join(workspaceRoot, "terminal-hook");
+  const job = { id: "question", workspaceRoot, pauseAndAsk: true, hooks: { end: `echo done >> '${hookFile}'` } };
   await runTrackedJob(job, async () => ({ exitStatus: 0, threadId: "same-thread", payload: { rawOutput: JSON.stringify({ question: "Which?", state: "awaiting-answer", draftAnswer: "A", facts: [], itemsHeld: [] }) } }));
   const stored = readJobFile(resolveJobFile(workspaceRoot, job.id));
   assert.equal(stored.status, "awaiting-answer"); assert.equal(stored.threadId, "same-thread");
+  assert.equal(fs.existsSync(hookFile), false);
   await runTrackedJob(stored, async () => ({ exitStatus: 0, threadId: "same-thread", payload: { rawOutput: "answered" } }));
   assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "completed");
+  assert.equal(fs.readFileSync(hookFile, "utf8"), "done\n");
 });
 
-test("detached watchdog publishes crash result and unlocks without status polling", async () => {
+test("detached watchdog publishes crash result and unlocks without status polling", async t => {
   const { spawn } = await import("node:child_process");
   const workspaceRoot = makeTempDir();
+  cleanupWatchdog(t, workspaceRoot, "crash");
   const resultFile = path.join(workspaceRoot, "crash-result.json");
   const lockFile = path.join(workspaceRoot, "held-lock");
   const hookFile = path.join(workspaceRoot, "failed");
@@ -121,9 +133,10 @@ test("detached watchdog publishes crash result and unlocks without status pollin
   } finally { worker.kill("SIGKILL"); await new Promise(resolve => server.close(resolve)); }
 });
 
-test("required unlock and result-file failures cannot report successful completion", async () => {
+test("required unlock and result-file failures cannot report successful completion", async t => {
   for (const failure of ["unlock", "result-file"]) {
     const workspaceRoot = makeTempDir();
+    cleanupWatchdog(t, workspaceRoot, failure);
     const occupied = path.join(workspaceRoot, "occupied");
     fs.writeFileSync(occupied, "file, not directory");
     const job = { id: failure, workspaceRoot, structured: true,

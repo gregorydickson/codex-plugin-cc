@@ -31,6 +31,11 @@
  *   usage: any,
  *   usageBaseline: any,
  *   children: Map<string, any>,
+ *   childThreadIds: Set<string>,
+ *   childFinalMessages: Map<string, string>,
+ *   childTurnStatuses: Map<string, string>,
+ *   fanoutLimit: number | null,
+ *   fanoutError: (Error & { code: string, requested: number, childThreadIds: string[] }) | null,
  *   messages: Array<{ lifecycle: string, phase: string | null, text: string }>,
  *   fileChanges: ThreadItem[],
  *   commandExecutions: ThreadItem[],
@@ -233,6 +238,16 @@ function registerThread(state, threadId, options = {}) {
   }
 
   state.threadIds.add(threadId);
+  if (state.fanoutLimit && threadId !== state.rootThreadId && threadId !== state.threadId) {
+    state.childThreadIds.add(threadId);
+    if (state.childThreadIds.size > state.fanoutLimit && !state.fanoutError) {
+      state.fanoutError = Object.assign(new Error(`Codex registered ${state.childThreadIds.size} child threads; --fanout permits ${state.fanoutLimit} across the entire turn, including replacements.`), {
+        code: "fanout_limit_exceeded", requested: state.fanoutLimit, childThreadIds: [...state.childThreadIds]
+      });
+      clearCompletionTimer(state);
+      state.rejectCompletion(state.fanoutError);
+    }
+  }
   const label =
     options.threadName ??
     options.name ??
@@ -340,6 +355,11 @@ function createTurnCaptureState(threadId, options = {}) {
     usage: null,
     usageBaseline: null,
     children: new Map(),
+    childThreadIds: new Set(),
+    childFinalMessages: new Map(),
+    childTurnStatuses: new Map(),
+    fanoutLimit: Number(options.fanout) || null,
+    fanoutError: null,
     messages: [],
     fileChanges: [],
     commandExecutions: [],
@@ -409,6 +429,7 @@ function belongsToTurn(state, message) {
   if (!messageThreadId || !state.threadIds.has(messageThreadId)) {
     return false;
   }
+  if (state.fanoutLimit && message.method === "turn/started" && state.childThreadIds.has(messageThreadId)) return true;
   const trackedTurnId = state.threadTurnIds.get(messageThreadId) ?? null;
   const messageTurnId = extractTurnId(message);
   return trackedTurnId === null || messageTurnId === null || messageTurnId === trackedTurnId;
@@ -437,7 +458,12 @@ function recordItem(state, item, lifecycle, threadId = null) {
     });
     if (item.text) {
       if (threadId && threadId !== state.threadId && lifecycle === "completed") {
-        state.children.set(threadId, { threadId, finalMessage: item.text });
+        if (!state.fanoutLimit) {
+          state.children.set(threadId, { threadId, finalMessage: item.text });
+        } else if (item.phase === "final_answer" || item.phase == null) {
+          state.childFinalMessages.set(threadId, item.text);
+          if (state.childTurnStatuses.get(threadId) === "completed") state.children.set(threadId, { threadId, finalMessage: item.text });
+        }
       }
       if (!threadId || threadId === state.threadId) {
         state.lastAgentMessage = item.text;
@@ -518,6 +544,11 @@ function applyTurnNotification(state, message) {
       break;
     case "turn/started":
       registerThread(state, message.params.threadId);
+      if (state.fanoutLimit && state.childThreadIds.has(message.params.threadId) && state.threadTurnIds.get(message.params.threadId) !== message.params.turn.id) {
+        state.children.delete(message.params.threadId);
+        state.childFinalMessages.delete(message.params.threadId);
+        state.childTurnStatuses.delete(message.params.threadId);
+      }
       state.threadTurnIds.set(message.params.threadId, message.params.turn.id);
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.add(message.params.threadId);
@@ -565,6 +596,13 @@ function applyTurnNotification(state, message) {
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.delete(message.params.threadId);
+        if (state.fanoutLimit) {
+          const childId = message.params.threadId;
+          state.childTurnStatuses.set(childId, message.params.turn.status);
+          const finalMessage = state.childFinalMessages.get(childId);
+          if (message.params.turn.status === "completed" && finalMessage) state.children.set(childId, { threadId: childId, finalMessage });
+          else state.children.delete(childId);
+        }
         scheduleInferredCompletion(state);
         break;
       }
@@ -580,11 +618,51 @@ function applyTurnNotification(state, message) {
   }
 }
 
+async function interruptFanoutTurns(client, state) {
+  // Cleanup is best effort and bounded: a broken app-server must not leave the
+  // capture waiting forever or turn failed interrupt requests into rejections.
+  const bounded = async action => {
+    let timer;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(action),
+        new Promise(resolve => { timer = setTimeout(() => resolve(null), 1000); })
+      ]);
+    } catch { return null; }
+    finally { clearTimeout(timer); }
+  };
+  const turns = new Map([[state.threadId, state.turnId]]);
+  for (const childId of state.childThreadIds) {
+    if (state.activeSubagentTurns.has(childId)) turns.set(childId, state.threadTurnIds.get(childId));
+  }
+  const interruptions = [];
+  const interrupted = new Set();
+  const interruptKnown = () => {
+    for (const [threadId, turnId] of turns) {
+      const key = `${threadId}:${turnId}`;
+      if (!turnId || interrupted.has(key)) continue;
+      interrupted.add(key);
+      interruptions.push(bounded(() => client.request("turn/interrupt", { threadId, turnId })));
+    }
+  };
+  interruptKnown();
+  await Promise.all([...state.childThreadIds].map(async childId => {
+    if (state.threadTurnIds.has(childId)) return;
+    const result = await bounded(() => client.request("thread/read", { threadId: childId, includeTurns: true }));
+    const active = result?.thread?.turns?.findLast(turn => turn.status === "inProgress");
+    if (active) turns.set(childId, active.id);
+  }));
+  // Notifications can reveal another active turn while thread/read is pending.
+  for (const childId of state.activeSubagentTurns) turns.set(childId, state.threadTurnIds.get(childId));
+  interruptKnown();
+  await Promise.all(interruptions);
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
 
-  client.setNotificationHandler((message) => {
+  const handleNotification = (message) => {
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
@@ -603,33 +681,37 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     applyTurnNotification(state, message);
-  });
+  };
+  client.setNotificationHandler(handleNotification);
 
   try {
     const response = await startRequest();
+    if (typeof response?.turn?.id !== "string" || !response.turn.id.trim()) {
+      throw Object.assign(new Error("Codex app-server returned a turn start response without a valid turn id."), { code: "codex_protocol_error" });
+    }
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
-    for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
-        applyTurnNotification(state, message);
-      } else {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-      }
-    }
+    for (const message of state.bufferedNotifications) handleNotification(message);
     state.bufferedNotifications.length = 0;
 
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);
     }
 
-    return await Promise.race([state.completion, client.exitPromise.then(() => {
+    const result = await Promise.race([state.completion, client.exitPromise.then(() => {
       throw client.exitError ?? new Error("Codex app-server disconnected before the turn completed.");
     })]);
+    if (state.fanoutError) throw state.fanoutError;
+    return result;
+  } catch (error) {
+    if (state.fanoutError) {
+      await interruptFanoutTurns(client, state);
+      throw state.fanoutError;
+    }
+    throw error;
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
@@ -1071,6 +1153,7 @@ export async function runAppServerReview(cwd, options = {}) {
         }),
       {
         onProgress: options.onProgress,
+        fanout: options.fanout,
         onResponse(response, state) {
           if (response.reviewThreadId) {
             state.threadIds.add(response.reviewThreadId);
@@ -1086,7 +1169,7 @@ export async function runAppServerReview(cwd, options = {}) {
         }
       }
     );
-    validateFanout(turnState, options.fanout);
+    await validateFanout(turnState, options.fanout, client);
 
     return {
       status: buildResultStatus(turnState),
@@ -1193,7 +1276,7 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: pauseSchema ?? options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress, onResponse(response) {
+      { onProgress: options.onProgress, fanout: options.fanout, onResponse(response) {
         options.onActiveTurn?.({ threadId, turnId: response.turn.id,
           send: (message) => client.request("turn/steer", {
             threadId, expectedTurnId: response.turn.id, input: buildTurnInput(message)
@@ -1210,7 +1293,7 @@ export async function runAppServerTurn(cwd, options = {}) {
     } else if (options.pauseAndAsk) {
       try { awaitingAnswer = JSON.parse(turnState.lastAgentMessage)?.state === "awaiting-answer"; } catch {}
     }
-    if (!awaitingAnswer) validateFanout(turnState, options.fanout);
+    if (!awaitingAnswer) await validateFanout(turnState, options.fanout, client);
     return {
       status: buildResultStatus(turnState),
       threadId,
@@ -1302,21 +1385,13 @@ export function createQuotaError(source) {
   });
 }
 
-export async function sendAppServerTurn(cwd, { threadId, turnId, message }) {
-  if (!threadId || !turnId || !String(message ?? "").trim()) throw new Error("An active thread, turn, and message are required.");
-  const broker = loadBrokerSession(cwd);
-  if (!broker?.endpoint) throw new Error("The active turn is not attached to a reachable broker; use the worker control channel.");
-  const client = await CodexAppServerClient.connect(cwd, { brokerEndpoint: broker.endpoint, reuseExistingBroker: true });
-  try {
-    await client.request("turn/steer", { threadId, expectedTurnId: turnId, input: buildTurnInput(message) });
-    return { accepted: true, threadId, turnId };
-  } finally { await client.close(); }
-}
-
-function validateFanout(state, requested) {
-  if (requested && state.finalTurn?.status === "completed" && state.children.size !== Number(requested)) {
-    throw Object.assign(new Error(`Codex returned ${state.children.size} child results; --fanout requested ${requested}. The selected model may not support delegation.`), {
-      code: "fanout_incomplete", children: [...state.children.values()], requested: Number(requested)
+async function validateFanout(state, requested, client) {
+  if (!requested || state.finalTurn?.status !== "completed") return;
+  if (state.fanoutError) throw state.fanoutError;
+  if (state.childThreadIds.size !== Number(requested) || state.children.size !== Number(requested) || state.activeSubagentTurns.size > 0 || [...state.childThreadIds].some(id => !state.children.has(id))) {
+    await interruptFanoutTurns(client, state);
+    throw Object.assign(new Error(`Codex registered ${state.childThreadIds.size} child threads and returned ${state.children.size} child results; --fanout requested ${requested}. The selected model may not support delegation.`), {
+      code: "fanout_incomplete", children: [...state.children.values()], childThreadIds: [...state.childThreadIds], requested: Number(requested)
     });
   }
 }

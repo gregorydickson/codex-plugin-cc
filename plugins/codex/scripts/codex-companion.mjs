@@ -49,6 +49,7 @@ import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
   readStoredJob,
+  publicJob,
   resolveCancelableJob,
   resolveResultJob,
   sortJobsNewestFirst
@@ -332,10 +333,11 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
   let snapshot = buildSingleJobSnapshot(cwd, reference);
+  const target = { workspaceRoot: snapshot.workspaceRoot, id: snapshot.job.id };
 
   while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
-    snapshot = buildSingleJobSnapshot(cwd, reference);
+    snapshot = buildSingleJobSnapshot(cwd, reference, { target });
   }
 
   return {
@@ -1020,7 +1022,14 @@ function handleResult(argv) {
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
   const storedJob = readStoredJob(workspaceRoot, job.id);
-  const payload = storedJob?.structured ? resultEnvelope(storedJob) : { ...resultEnvelope(storedJob ?? job), job, storedJob };
+  const publicStoredResult = storedJob ? {
+    ...publicJob(storedJob),
+    rendered: storedJob.rendered ?? null,
+    result: storedJob.result ?? null,
+    rawOutput: storedJob.rawOutput ?? null,
+    parseError: storedJob.parseError ?? null
+  } : null;
+  const payload = storedJob?.structured ? resultEnvelope(storedJob) : { ...resultEnvelope(storedJob ?? job), job: publicJob(job), storedJob: publicStoredResult };
 
   outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
 }
@@ -1091,21 +1100,32 @@ async function handleCancel(argv) {
 
   appendLogLine(job.logFile, "Cancelled by user.");
 
-  const nextJob = await finalizeTrackedJob(workspaceRoot, job.id, {
+  const cancellation = {
     status: "cancelled", phase: "cancelled", pid: null,
     completedAt: nowIso(), cancelledAt: nowIso(), errorMessage: "Cancelled by user."
-  }, { beforeTransition: latest => { if (["queued", "running"].includes(latest.status)) terminateProcessTree(latest.pid ?? latest.workerPid ?? Number.NaN); } });
+  };
+  let nextJob = await finalizeTrackedJob(workspaceRoot, job.id, cancellation, {
+    beforeTransition: latest => { if (["queued", "running"].includes(latest.status)) terminateProcessTree(latest.pid ?? latest.workerPid ?? Number.NaN); }
+  });
+  // A signalled worker can still appear alive while it owns finalization. Give
+  // that exit time to settle, then recover its transition and publication errors.
+  const settleDeadline = Date.now() + 1000;
+  while (["queued", "running", "awaiting-answer"].includes(nextJob.status) && nextJob.cancelRequested && Date.now() < settleDeadline) {
+    await sleep(50);
+    nextJob = await finalizeTrackedJob(workspaceRoot, job.id, cancellation);
+  }
 
   const payload = {
     jobId: job.id,
     status: nextJob.status,
+    ...(["queued", "running", "awaiting-answer"].includes(nextJob.status) && nextJob.cancelRequested ? { cancellationRequested: true } : {}),
     title: job.title,
     turnInterruptAttempted: interrupt.attempted,
     turnInterrupted: interrupt.interrupted,
     ...(nextJob.errorCode ? { error: nextJob.errorCode, message: nextJob.errorMessage } : {})
   };
 
-  outputCommandResult(payload, nextJob.status === "cancelled" ? renderCancelReport(nextJob) : `Job ${job.id}: ${nextJob.status}. ${nextJob.errorMessage ?? ""}\n`, options.json);
+  outputCommandResult(payload, payload.cancellationRequested ? "Cancellation requested; finalization pending.\n" : nextJob.status === "cancelled" ? renderCancelReport(nextJob) : `Job ${job.id}: ${nextJob.status}. ${nextJob.errorMessage ?? ""}\n`, options.json);
   if (nextJob.status === "failed" || nextJob.status === "orphaned") process.exitCode = 1;
 }
 
@@ -1123,7 +1143,7 @@ async function handleSessions(argv) {
   for (const root of new Set(listJobsAcrossWorktrees(cwd).map(job => job.workspaceRoot))) await reconcileOrphanedJobs(root);
   if (action === "list") {
     const sessions = listJobsAcrossWorktrees(cwd).filter(job => !job.resumedTo && (job.name || job.persistent));
-    outputCommandResult(sessions, sessions.map(job => `${job.name ?? job.id} ${job.status} ${job.threadId ?? ""}\n`).join(""), options.json);
+    outputCommandResult(sessions.map(publicJob), sessions.map(job => `${job.name ?? job.id} ${job.status} ${job.threadId ?? ""}\n`).join(""), options.json);
     return;
   }
   if (!reference) throw new Error("Provide a session name or job id.");
@@ -1146,15 +1166,16 @@ async function resumeSession(previous, prompt, options = {}) {
   options = { ...options, answering: options.answering || previous.status === "awaiting-answer" };
   // Each turn gets a fresh job id and terminal-delivery record; the name follows the latest turn.
   const job = { ...previous, id: options.answering ? previous.id : generateJobId("task"), createdAt: nowIso(), status: "queued", threadId: previous.threadId,
-    pid: null, workerPid: null, completedAt: null, result: null, rendered: null, errorMessage: null, errorCode: null,
+    pid: null, workerPid: null, watchdogPid: null, completedAt: null, result: null, rendered: null, errorMessage: null, errorCode: null,
     schemaValid: null, parseError: null, lockAcquired: false, logFile: null, changedFilesBefore: null,
+    changedFiles: options.answering ? previous.changedFiles : [], externalLock: null, finalization: null, terminalDelivery: null, pauseDelivery: null, changedFilesError: options.answering ? previous.changedFilesError : null,
     resumedFrom: options.answering ? previous.resumedFrom : previous.id, resumedTo: null,
     deliveryErrors: null, unlockError: null, usage: null, startedAt: null, cancelledAt: null, cancelRequested: false, structured: true };
   const request = { ...previous.request, resumeLast: false, resumeThreadId: previous.threadId, prompt, jobId: job.id };
   job.request = request;
   withFileLockSync(path.join(resolveStateDir(workspaceRoot), "sessions.lock"), () => withFileLockSync(`${resolveJobFile(workspaceRoot, previous.id)}.lock`, () => {
     const latest = readStoredJob(workspaceRoot, previous.id);
-    if (!latest || latest.status !== previous.status || latest.resumedTo || latest.cancelRequested) throw new Error("Session was already resumed or changed; inspect its current status.");
+    if (!latest || latest.status !== previous.status || latest.resumedTo || (latest.cancelRequested && ["queued", "running", "awaiting-answer"].includes(latest.status))) throw new Error("Session was already resumed or changed; inspect its current status.");
     if (options.answering) {
       writeJobFile(workspaceRoot, job.id, job); upsertJob(workspaceRoot, job);
     } else {
@@ -1197,16 +1218,40 @@ async function handleSend(argv) {
 async function runComparisonPeer(command, cwd, input) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, { cwd, shell: true, detached: true, stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "", stderr = "";
-    const timer = setTimeout(() => { terminateProcessTree(child.pid); reject(new Error("Comparison peer timed out.")); }, 240000);
-    child.on("error", error => { clearTimeout(timer); reject(error); });
-    child.stdout.on("data", chunk => { stdout += chunk; });
-    child.stderr.on("data", chunk => { stderr += chunk; });
+    const maxOutputBytes = 1024 * 1024;
+    const stdout = [], stderr = [];
+    let outputBytes = 0, stopped = false;
+    const fail = error => {
+      if (stopped) return;
+      stopped = true;
+      clearTimeout(timer);
+      terminateProcessTree(child.pid);
+      if (process.platform !== "win32" && Number.isInteger(child.pid)) setTimeout(() => {
+        try { process.kill(-child.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+      }, 250);
+      reject(error);
+    };
+    const timer = setTimeout(() => fail(new Error("Comparison peer timed out.")), 240000);
+    child.on("error", fail);
+    const capture = (chunk, isError) => {
+      if (stopped) return;
+      outputBytes += chunk.length;
+      if (outputBytes > maxOutputBytes) {
+        fail(new Error(`Comparison peer exceeded combined output limit (${maxOutputBytes} bytes).`));
+        return;
+      }
+      if (isError) stderr.push(chunk);
+      else stdout.push(chunk);
+    };
+    child.stdout.on("data", chunk => capture(chunk, false));
+    child.stderr.on("data", chunk => capture(chunk, true));
     child.stdin.on("error", () => {});
     child.on("close", code => {
       clearTimeout(timer);
-      if (code !== 0) reject(new Error(`Comparison peer failed (${code}): ${stderr}`));
-      else { try { resolve(JSON.parse(stdout)); } catch { reject(new Error("Comparison peer did not return JSON.")); } }
+      if (stopped) return;
+      stopped = true;
+      if (code !== 0) reject(new Error(`Comparison peer failed (${code}): ${Buffer.concat(stderr).subarray(-4096).toString()}`));
+      else { try { resolve(JSON.parse(Buffer.concat(stdout).toString())); } catch { reject(new Error("Comparison peer did not return JSON.")); } }
     });
     child.stdin.end(JSON.stringify(input) + "\n");
   });

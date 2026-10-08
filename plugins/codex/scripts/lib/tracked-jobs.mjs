@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import process from "node:process";
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { withFileLockSync } from "./file-lock.mjs";
@@ -78,11 +79,13 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastThreadId = null;
   let lastTurnId = null;
 
-  return (event) => withFileLockSync(`${resolveJobFile(workspaceRoot, jobId)}.lock`, () => {
+  return (event) => {
     const normalized = normalizeProgressEvent(event);
+    let progressJob = null;
+    withFileLockSync(`${resolveJobFile(workspaceRoot, jobId)}.lock`, () => {
     const current = readStoredJobOrNull(workspaceRoot, jobId);
     if (!current || TERMINAL_STATUSES.has(current.status)) return;
-    if (current) void emitJobEvent(current, "progress", { progress: normalized });
+    progressJob = current;
     const patch = { id: jobId };
     let changed = false;
 
@@ -120,7 +123,9 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       ...storedJob,
       ...patch
     });
-  }, { timeoutMs: 45000 });
+    }, { timeoutMs: 45000 });
+    if (progressJob) void emitJobEvent(progressJob, "progress", { progress: normalized });
+  };
 }
 
 export function createProgressReporter({ stderr = false, logFile = null, onEvent = null } = {}) {
@@ -150,67 +155,121 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
 
 export const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "orphaned"]);
 
+function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code !== "ESRCH"; }
+}
+
+function mutateJob(workspaceRoot, jobId, change) {
+  return withFileLockSync(`${resolveJobFile(workspaceRoot, jobId)}.lock`, () => {
+    const current = readStoredJobOrNull(workspaceRoot, jobId) ?? listJobs(workspaceRoot).find(job => job.id === jobId);
+    if (!current) throw new Error(`Unknown job ${jobId}`);
+    current.workspaceRoot ??= workspaceRoot;
+    const next = change(current);
+    writeJobFile(workspaceRoot, jobId, next);
+    upsertJob(workspaceRoot, next);
+    return next;
+  }, { timeoutMs: 45000 });
+}
+
+// Persist the final snapshot before releasing ownership. A replay never snapshots
+// an unlocked worktree, and each answer starts a fresh segment baseline.
+function closeSegment(workspaceRoot, jobId) {
+  let job = mutateJob(workspaceRoot, jobId, current => {
+    const next = { ...current };
+    if (next.changedFilesBefore) {
+      try {
+        next.changedFiles = [...new Set([...(next.changedFiles ?? []), ...changedFilesSince(next.changedFilesBefore, snapshotChangedFiles(workspaceRoot))])].sort();
+        next.result = { ...next.result, changedFiles: next.changedFiles };
+      } catch (error) { next.changedFilesError = error.message; }
+      next.changedFilesBefore = null;
+    }
+    if (next.externalLock && next.externalLock.state !== "released") next.externalLock = { ...next.externalLock, state: "releasing" };
+    return next;
+  });
+  if ((job.externalLock && job.externalLock.state !== "released") || job.lockAcquired) {
+    try {
+      runJobCommand(job.unlockCmd, job);
+      job = mutateJob(workspaceRoot, jobId, current => ({ ...current, lockAcquired: false, externalLock: current.externalLock ? { ...current.externalLock, state: "released" } : null, unlockError: null }));
+    } catch (error) {
+      job = mutateJob(workspaceRoot, jobId, current => ({ ...current, unlockError: error.message }));
+    }
+  }
+  return job;
+}
+
+// An outbox entry is acknowledged only after delivery. A crash can replay a
+// delivered event; consumers must deduplicate deliveryId, including shell hooks.
+export async function replayTerminalDelivery(workspaceRoot, jobId) {
+  const stored = readStoredJobOrNull(workspaceRoot, jobId);
+  if (stored && TERMINAL_STATUSES.has(stored.status) && (stored.lockAcquired || (stored.externalLock && stored.externalLock.state !== "released"))) closeSegment(workspaceRoot, jobId);
+  let claimed = false;
+  let job = mutateJob(workspaceRoot, jobId, current => {
+    if (!TERMINAL_STATUSES.has(current.status) || !current.terminalDelivery || current.terminalDelivery.delivered || alive(current.terminalDelivery.senderPid) || alive(current.pauseDelivery?.senderPid)) return current;
+    claimed = true;
+    return { ...current, terminalDelivery: { ...current.terminalDelivery, senderPid: process.pid } };
+  });
+  if (!claimed) return job;
+  const delivery = job.terminalDelivery;
+  const errors = await emitJobEvent(job, delivery.event, { ...resultEnvelope(job), deliveryId: delivery.id });
+  job = mutateJob(workspaceRoot, jobId, current => {
+    if (current.terminalDelivery?.id !== delivery.id) return current;
+    return { ...current, deliveryErrors: errors, terminalDelivery: { ...current.terminalDelivery, senderPid: null, delivered: errors.length === 0 } };
+  });
+  return job;
+}
+
 export async function finalizeTrackedJob(workspaceRoot, jobId, patch, options = {}) {
-  let transitioned = false;
-  const completed = withFileLockSync(`${resolveJobFile(workspaceRoot, jobId)}.lock`, () => {
-    const existing = readStoredJobOrNull(workspaceRoot, jobId) ?? listJobs(workspaceRoot).find(candidate => candidate.id === jobId);
-    if (existing) existing.workspaceRoot ??= workspaceRoot;
-    if (!existing) throw new Error(`Unknown job ${jobId}`);
+  let claimed = false;
+  let job = mutateJob(workspaceRoot, jobId, existing => {
     if (TERMINAL_STATUSES.has(existing.status)) return existing;
     if (options.expectedOwnerPid != null && (!["queued", "running"].includes(existing.status) || (existing.pid ?? existing.workerPid) !== options.expectedOwnerPid)) return existing;
     options.beforeTransition?.(existing);
-    const status = existing.cancelRequested ? "cancelled" : patch.status;
-    const completed = { ...existing, ...patch, status, pid: null, workerPid: null, completedAt: nowIso(), phase: status === "completed" ? "done" : status };
-    if (completed.lockAcquired && completed.unlockCmd) {
-      try { runJobCommand(completed.unlockCmd, completed); }
-      catch (error) {
-        completed.unlockError = error.message;
+    if (existing.finalization && alive(existing.finalization.pid)) return { ...existing, cancelRequested: existing.cancelRequested || patch.status === "cancelled" };
+    claimed = true;
+    return { ...existing, finalization: { pid: process.pid, patch: existing.finalization?.patch ?? patch }, cancelRequested: existing.cancelRequested || patch.status === "cancelled" };
+  });
+  if (claimed) {
+    job = closeSegment(workspaceRoot, jobId);
+    job = mutateJob(workspaceRoot, jobId, existing => {
+      const terminalPatch = existing.finalization.patch;
+      const status = existing.cancelRequested ? "cancelled" : terminalPatch.status;
+      const completed = { ...existing, ...terminalPatch, status, pid: null, workerPid: null, completedAt: nowIso(), phase: status === "completed" ? "done" : status, finalization: null };
+      if (existing.changedFiles) completed.result = { ...completed.result, changedFiles: existing.changedFiles };
+      if (completed.unlockError) {
         completed.status = "failed"; completed.phase = "failed";
-        completed.errorCode = "unlock_failed"; completed.errorMessage = `Worktree unlock failed: ${error.message}`;
+        completed.errorCode = "unlock_failed"; completed.errorMessage = `Worktree unlock failed: ${completed.unlockError}`;
       }
-      completed.lockAcquired = false;
-    }
-    if (completed.changedFilesBefore) {
-      try { completed.result = { ...completed.result, changedFiles: changedFilesSince(completed.changedFilesBefore, snapshotChangedFiles(workspaceRoot)) }; }
-      catch (error) { completed.changedFilesError = error.message; }
-    }
-    const envelope = resultEnvelope(completed);
-    completed.schemaValid = envelope.schemaValid;
-    completed.parseError = envelope.parseError;
-    if (completed.resultFile) {
-      try { atomicWriteJson(completed.resultFile, envelope); }
-      catch (error) {
-        completed.deliveryErrors = [error.message];
+      if (completed.worktree && completed.changedFilesError) {
         completed.status = "failed"; completed.phase = "failed";
-        completed.errorCode = "result_file_failed"; completed.errorMessage = `Result-file publication failed: ${error.message}`;
+        completed.errorCode = "changed_files_failed"; completed.errorMessage = `Changed-file report failed: ${completed.changedFilesError}`;
       }
-    }
-    if (completed.unlockError || completed.errorCode === "result_file_failed") completed.rendered = `${completed.rendered ?? ""}\nJob failed: ${completed.errorMessage}\n`;
-    writeJobFile(workspaceRoot, jobId, completed);
-    upsertJob(workspaceRoot, completed);
-    transitioned = true;
-    return completed;
-  }, { timeoutMs: 45000 });
-  if (!transitioned) return completed;
-  const envelope = resultEnvelope(completed);
-  const deliveryErrors = [...(completed.deliveryErrors ?? [])];
-  deliveryErrors.push(...await emitJobEvent(completed, completed.status === "failed" || completed.status === "orphaned" ? "fail" : "end", { ...envelope }));
-  if (deliveryErrors.length) {
-    completed.deliveryErrors = deliveryErrors;
-    withFileLockSync(`${resolveJobFile(workspaceRoot, jobId)}.lock`, () => {
-      const current = readStoredJobOrNull(workspaceRoot, jobId);
-      if (!current || current.completedAt !== completed.completedAt) return;
-      const updated = { ...current, deliveryErrors };
-      writeJobFile(workspaceRoot, jobId, updated);
-      upsertJob(workspaceRoot, updated);
-    }, { timeoutMs: 45000 });
+      const envelope = resultEnvelope(completed);
+      completed.schemaValid = envelope.schemaValid;
+      completed.parseError = envelope.parseError;
+      if (completed.resultFile) {
+        try { atomicWriteJson(completed.resultFile, envelope); }
+        catch (error) {
+          completed.deliveryErrors = [error.message];
+          completed.status = "failed"; completed.phase = "failed";
+          completed.errorCode = "result_file_failed"; completed.errorMessage = `Result-file publication failed: ${error.message}`;
+        }
+      }
+      if (completed.unlockError || ["result_file_failed", "changed_files_failed"].includes(completed.errorCode)) completed.rendered = `${completed.rendered ?? ""}\nJob failed: ${completed.errorMessage}\n`;
+      completed.terminalDelivery = { id: randomUUID(), event: completed.status === "failed" || completed.status === "orphaned" ? "fail" : "end", delivered: false, senderPid: null };
+      return completed;
+    });
   }
-  return completed;
+  return replayTerminalDelivery(workspaceRoot, jobId);
 }
 
 export async function reconcileOrphanedJobs(workspaceRoot) {
   const reconciled = [];
   for (const job of listJobs(workspaceRoot)) {
+    if (TERMINAL_STATUSES.has(job.status)) {
+      if ((job.terminalDelivery && !job.terminalDelivery.delivered) || job.lockAcquired || (job.externalLock && job.externalLock.state !== "released")) await replayTerminalDelivery(workspaceRoot, job.id);
+      continue;
+    }
     if (!["running", "queued"].includes(job.status) || !Number.isInteger(job.pid ?? job.workerPid) || (job.pid ?? job.workerPid) <= 0) continue;
     try { process.kill(job.pid ?? job.workerPid, 0); }
     catch (error) {
@@ -227,6 +286,7 @@ function startJobWatchdog(job) {
   });
   watchdog.on("error", error => appendLogLine(job.logFile, `Watchdog failed: ${error.message}`));
   watchdog.unref();
+  return watchdog.pid ?? null;
 }
 
 function updateActiveJob(job, update) {
@@ -249,23 +309,29 @@ export async function runTrackedJob(job, runner, options = {}) {
   try {
     runningRecord = updateActiveJob(job, current => ({ ...current, ...job, status: "running", cancelRequested: Boolean(current.cancelRequested || job.cancelRequested), startedAt: nowIso(), phase: "starting", pid: process.pid, logFile: options.logFile ?? job.logFile ?? null }));
     if (TERMINAL_STATUSES.has(runningRecord.status)) return finishedExecution(runningRecord, job.structured);
+    if (job.structured) {
+      const watchdogPid = startJobWatchdog(runningRecord);
+      runningRecord = updateActiveJob(job, current => ({ ...current, watchdogPid }));
+    }
+    if (job.worktree) validateWorktree(job.worktree);
+    if (job.lockCmd && !runningRecord.cancelRequested) {
+      runningRecord = updateActiveJob(job, current => ({ ...current, externalLock: { token: randomUUID(), state: "acquiring", ownerPid: process.pid } }));
+      if (TERMINAL_STATUSES.has(runningRecord.status)) return finishedExecution(runningRecord, job.structured);
+      if (runningRecord.cancelRequested) return finishedExecution(await finalizeTrackedJob(job.workspaceRoot, job.id, { status: "cancelled" }), job.structured);
+      runJobCommand(job.lockCmd, runningRecord);
+      runningRecord = updateActiveJob(job, current => ({ ...current, lockAcquired: true, externalLock: { ...current.externalLock, state: "acquired" } }));
+    }
     runningRecord = updateActiveJob(job, current => {
       const next = { ...current };
       if (next.cancelRequested) return next;
-      if (job.worktree) validateWorktree(job.worktree);
       if (job.worktree) next.changedFilesBefore = snapshotChangedFiles(job.workspaceRoot);
       else if (job.structured || job.write) {
-        try { next.changedFilesBefore = snapshotChangedFiles(job.workspaceRoot); } catch {}
-      }
-      if (job.lockCmd) {
-        runJobCommand(job.lockCmd, next);
-        next.lockAcquired = true;
+        try { next.changedFilesBefore = snapshotChangedFiles(job.workspaceRoot); } catch (error) { next.changedFilesError = error.message; }
       }
       return next;
     });
     if (TERMINAL_STATUSES.has(runningRecord.status)) return finishedExecution(runningRecord, job.structured);
     if (runningRecord.cancelRequested) return finishedExecution(await finalizeTrackedJob(job.workspaceRoot, job.id, { status: "cancelled" }), job.structured);
-    if (job.structured) startJobWatchdog(runningRecord);
     await emitJobEvent(runningRecord, "start");
     const beforeRun = readStoredJobOrNull(job.workspaceRoot, job.id);
     if (!beforeRun || TERMINAL_STATUSES.has(beforeRun.status)) return finishedExecution(beforeRun ?? { status: "cancelled" }, job.structured);
@@ -275,16 +341,35 @@ export async function runTrackedJob(job, runner, options = {}) {
     let stopReport = payload?.result ?? null;
     if (!stopReport && payload?.rawOutput) { try { stopReport = JSON.parse(payload.rawOutput); } catch {} }
     if (job.pauseAndAsk && stopReport?.question && stopReport?.state === "awaiting-answer") {
+      let pauseClaimed = false;
+      updateActiveJob(job, current => {
+        if (current.finalization || current.cancelRequested) return current;
+        pauseClaimed = true;
+        return { ...current, finalization: { pid: process.pid, patch: null } };
+      });
+      if (!pauseClaimed) return finishedExecution(await finalizeTrackedJob(job.workspaceRoot, job.id, { status: "cancelled" }), job.structured);
+      closeSegment(job.workspaceRoot, job.id);
       const paused = updateActiveJob(job, current => {
-        if (current.cancelRequested) return current;
-        const next = { ...current, status: "awaiting-answer", phase: "awaiting-answer", pid: null, workerPid: null, threadId: execution.threadId, turnId: execution.turnId, result: payload, rendered: execution.rendered };
-        if (next.lockAcquired) { runJobCommand(next.unlockCmd, next); next.lockAcquired = false; }
+        if (current.cancelRequested) return { ...current, finalization: null };
+        const next = { ...current, status: "awaiting-answer", phase: "awaiting-answer", pid: null, workerPid: null, threadId: execution.threadId, turnId: execution.turnId, result: { ...payload, changedFiles: current.changedFiles ?? [] }, rendered: execution.rendered, finalization: null, pauseDelivery: { id: randomUUID(), senderPid: process.pid } };
+        if (next.worktree && next.changedFilesError) throw new Error(`Changed-file report failed: ${next.changedFilesError}`);
+        if (next.unlockError) throw new Error(`Worktree unlock failed: ${next.unlockError}`);
+        // Publication shares the transition lock: cancellation can only publish
+        // after this envelope, never before a stale pause overwrites it.
+        if (next.resultFile) atomicWriteJson(next.resultFile, resultEnvelope(next));
         return next;
       });
       if (TERMINAL_STATUSES.has(paused.status)) return finishedExecution(paused, job.structured);
       if (paused.cancelRequested) return finishedExecution(await finalizeTrackedJob(job.workspaceRoot, job.id, { status: "cancelled" }), job.structured);
-      if (paused.resultFile) atomicWriteJson(paused.resultFile, resultEnvelope(paused));
-      await emitJobEvent(paused, "stop-report", { ...resultEnvelope(paused), stopReport });
+      try {
+        const latest = readStoredJobOrNull(job.workspaceRoot, job.id);
+        if (latest?.status === "awaiting-answer" && latest.pauseDelivery?.id === paused.pauseDelivery.id) await emitJobEvent(paused, "stop-report", { ...resultEnvelope(paused), stopReport, deliveryId: paused.pauseDelivery.id });
+      } finally {
+        mutateJob(job.workspaceRoot, job.id, current => current.pauseDelivery?.id === paused.pauseDelivery.id ? { ...current, pauseDelivery: null } : current);
+        await replayTerminalDelivery(job.workspaceRoot, job.id);
+      }
+      const afterPause = readStoredJobOrNull(job.workspaceRoot, job.id);
+      if (afterPause && TERMINAL_STATUSES.has(afterPause.status)) return finishedExecution(afterPause, job.structured);
       if (job.structured) execution.payload = resultEnvelope(paused);
       return execution;
     }
@@ -297,11 +382,12 @@ export async function runTrackedJob(job, runner, options = {}) {
       ...(execution.error ? { errorCode: execution.error.error ?? execution.error.code, errorMessage: execution.error.message, retryAfter: execution.error.retryAfter } : {})
     });
     if (completed.status !== "completed" && execution.exitStatus === 0) execution.exitStatus = 1;
-    if (completed.unlockError || completed.errorCode === "result_file_failed") execution.rendered = completed.rendered;
+    if (completed.unlockError || ["result_file_failed", "changed_files_failed"].includes(completed.errorCode)) execution.rendered = completed.rendered;
     appendLogBlock(runningRecord.logFile, "Final output", execution.rendered);
     if (job.structured) execution.payload = resultEnvelope(completed);
     return execution;
   } catch (error) {
+    mutateJob(job.workspaceRoot, job.id, current => current.finalization?.pid === process.pid && !current.finalization.patch ? { ...current, finalization: null } : current);
     await finalizeTrackedJob(job.workspaceRoot, job.id, { status: "failed", errorMessage: error instanceof Error ? error.message : String(error), errorCode: error.code, retryAfter: error.retryAfter });
     throw error;
   }

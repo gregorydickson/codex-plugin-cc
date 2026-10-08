@@ -4,7 +4,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
-import { loadState, readJobFile, resolveJobFile, resolveStateFile, updateState, upsertJob, writeJobFile } from "./lib/state.mjs";
+import { hasPendingJobRecovery, listJobsAcrossWorktrees, loadState, readJobFile, resolveJobFile, resolveStateFile, updateState, upsertJob, writeJobFile } from "./lib/state.mjs";
 import { withFileLockSync } from "./lib/file-lock.mjs";
 import { interruptAppServerTurn } from "./lib/codex.mjs";
 import { finalizeTrackedJob } from "./lib/tracked-jobs.mjs";
@@ -38,7 +38,11 @@ async function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const roots = new Set(listJobsAcrossWorktrees(resolveWorkspaceRoot(cwd)).map(job => job.workspaceRoot));
+  for (const root of roots) await cleanupWorkspaceJobs(root, sessionId);
+}
+
+async function cleanupWorkspaceJobs(workspaceRoot, sessionId) {
   const stateFile = resolveStateFile(workspaceRoot);
   if (!fs.existsSync(stateFile)) {
     return;
@@ -78,7 +82,7 @@ async function cleanupSessionJobs(cwd, sessionId) {
   }
   const removedIds = new Set(removed.map((job) => job.id));
   updateState(workspaceRoot, (state) => {
-    state.jobs = state.jobs.filter((job) => !removedIds.has(job.id) || !owned(job));
+    state.jobs = state.jobs.filter((job) => !removedIds.has(job.id) || !owned(job) || hasPendingJobRecovery(job));
   });
 }
 

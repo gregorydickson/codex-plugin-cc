@@ -342,7 +342,7 @@ slash command.
 | Controlled writes | `--write --worktree` selects a Git worktree, with optional external lock/unlock commands and `changedFiles` reporting. |
 | Lifecycle collection | Result files, Unix socket notifications, shell hooks, and a detached watchdog support collecting background work. |
 | Comparison and verification | `compare` compares schema-valid peer results; `verify-claims` checks claims against source at a pinned Git revision. |
-| Usage and fan-out | Token usage, quota-exhaustion errors, and `--fanout N` expose supported Codex child-worker behavior. |
+| Usage and fan-out | Token usage, quota-exhaustion errors, and `--fanout N` with cumulative child limits and completed child results expose supported Codex child-worker behavior. |
 
 ### Start a typed background worker
 
@@ -409,19 +409,23 @@ Concurrent callers now serialize shared broker startup. Ending one Claude sessio
 leaves the shared broker available to other sessions, and the broker still reaps
 itself after its idle timeout.
 
-The worker interface is under active development. Known gaps include
-crash-time lock cleanup and hook delivery, cancellation/pause races, stopped-session
-resumption, linked-worktree SessionEnd cleanup, and changed-file accounting across
-locks and pauses. Account for these gaps before relying on unattended write workers.
-Socket delivery is best effort, and arbitrary shell hooks cannot guarantee exactly
-one external side effect across a process crash; use idempotent hooks and retain
-result files for collection.
+Terminal notifications and lock cleanup recover from process crashes. Replayed
+terminal events carry a stable `deliveryId` (`CODEX_JOB_DELIVERY_ID` for hooks);
+consumers must deduplicate that ID atomically with their side effect. External lock
+commands must use the supplied ownership token and support idempotent release and
+cancellation of pending acquisition. See the guide for the complete lock contract.
+Progress notifications are best effort and coalesced; keep a result file for collection.
 
-Protect stored job state and raw status/session JSON: resolved MCP configuration
-can contain credentials. Profile network allowlists cover sandboxed command traffic,
-not hosted web tools, apps, or MCP server networking. MCP availability, network
-policy enforcement, and child-worker support depend on the installed Codex runtime.
-Parent token usage does not include child usage or estimate dollar cost.
+Snapshots run inside each lock segment and accumulate across pause/answer. Explicit
+worktree accounting fails when its 10,000-entry / 64 MiB content budget is exceeded.
+Comparison peer output has a combined 1 MiB stdout/stderr limit.
+
+Private job state retains resolved configuration for resumption; protect that directory.
+Public status/session output excludes that configuration and executable commands.
+Profile network allowlists cover sandboxed command traffic, not hosted web tools,
+apps, or MCP server networking. MCP availability, network policy enforcement, and
+child-worker support depend on the installed Codex runtime. Parent token usage does
+not include child usage or estimate dollar cost.
 
 See the [worker CLI guide](plugins/codex/docs/workers.md) for configuration formats,
 notification events, worktree locking, comparison inputs, claim verification, and

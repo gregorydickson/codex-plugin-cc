@@ -63,12 +63,38 @@ export function runJobCommand(command, job, event = null) {
   const result = spawnSync(command, {
     shell: true, cwd: job.workspaceRoot, encoding: "utf8", timeout: 30000,
     input: event ? `${JSON.stringify(event)}\n` : "",
-    env: { ...process.env, CODEX_JOB_ID: job.id, CODEX_JOB_EVENT: event?.event ?? "", CODEX_JOB_WORKTREE: job.workspaceRoot }
+    env: { ...process.env, CODEX_JOB_ID: job.id, CODEX_JOB_EVENT: event?.event ?? "", CODEX_JOB_WORKTREE: job.workspaceRoot, CODEX_JOB_DELIVERY_ID: event?.deliveryId ?? "", CODEX_JOB_LOCK_TOKEN: job.externalLock?.token ?? "", CODEX_JOB_OWNER_PID: String(job.externalLock?.ownerPid ?? job.pid ?? process.pid) }
   });
   if (result.error || result.status !== 0) throw new Error(`Job command failed: ${result.error?.message ?? result.stderr ?? result.status}`);
 }
 
-export async function emitJobEvent(job, event, data = {}) {
+const progressDeliveries = new Map();
+
+export function emitJobEvent(job, event, data = {}) {
+  if (event !== "progress") return deliverJobEvent(job, event, data);
+  const key = `${job.workspaceRoot}:${job.id}`;
+  const pending = progressDeliveries.get(key);
+  if (pending) {
+    pending.latest = { job, data };
+    return pending.promise;
+  }
+  const state = { latest: { job, data }, promise: null };
+  progressDeliveries.set(key, state);
+  state.promise = (async () => {
+    try {
+      let errors = [];
+      while (state.latest) {
+        const next = state.latest;
+        state.latest = null;
+        errors = await deliverJobEvent(next.job, event, next.data);
+      }
+      return errors;
+    } finally { progressDeliveries.delete(key); }
+  })();
+  return state.promise;
+}
+
+async function deliverJobEvent(job, event, data = {}) {
   const message = { event, jobId: job.id, timestamp: new Date().toISOString(), ...data };
   const failures = [];
   if (job.notifySocket) {
@@ -84,7 +110,7 @@ export async function emitJobEvent(job, event, data = {}) {
       socket.setTimeout(1000, () => finish(new Error("Notification socket timed out")));
       socket.on("error", finish);
       socket.on("connect", () => socket.end(`${JSON.stringify(message)}\n`, () => finish()));
-    });
+    }).catch(error => failures.push(error.message));
   }
   try { runJobCommand(job.hooks?.[event], job, message); } catch (error) { failures.push(error.message); }
   return failures;

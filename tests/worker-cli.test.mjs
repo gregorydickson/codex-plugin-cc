@@ -1,4 +1,8 @@
 import fs from "node:fs";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { writeJobFile, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
+import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -10,7 +14,7 @@ const script = fileURLToPath(new URL("../plugins/codex/scripts/codex-companion.m
 function setup(behavior) {
   const root = makeTempDir(); initGitRepo(root);
   const bin = makeTempDir(); installWorkerCodex(bin, behavior);
-  const env = { ...buildEnv(bin), CODEX_COMPANION_SESSION_ID: "worker-tests" };
+  const env = { ...buildEnv(bin), CODEX_HOME: makeTempDir(), CODEX_COMPANION_SESSION_ID: "worker-tests" };
   const schema = path.join(root, "schema.json");
   fs.writeFileSync(schema, JSON.stringify({ type: "object", required: ["count"], properties: { count: { type: "integer" } }, additionalProperties: false }));
   const cli = (...args) => {
@@ -93,4 +97,68 @@ test("cancel reports a required result-file publication failure", () => {
   const report = JSON.parse(cancelled.stdout);
   assert.equal(report.status, "failed");
   assert.equal(report.error, "result_file_failed");
+});
+
+test("stopped named sessions resume their thread with private configuration intact", () => {
+  const { root, cli } = setup();
+  const secret = "credential-sentinel-never-public";
+  fs.writeFileSync(path.join(root, "mcp.json"), JSON.stringify({ mcp_servers: { private: { command: "unused", env: { TOKEN: secret } } } }));
+  const initial = cli("task", "--name", "private-session", "--pause-and-ask", "--mcp-config", "mcp.json", "--on-end", `true ${secret}`, "NEED_ANSWER");
+  assert.equal(initial.status, "awaiting-answer");
+  assert.ok(!JSON.stringify(initial).includes(secret));
+  for (const args of [["status", "--all-sessions"], ["status", initial.jobId], ["sessions", "list"], ["result", initial.jobId]]) {
+    const output = cli(...args);
+    assert.ok(!JSON.stringify(output).includes(secret), `Secret exposed by ${args.join(" ")}`);
+    const records = args[0] === "sessions" ? output : args[0] === "status" ? [output.job ?? output.latestFinished] : [output.job];
+    assert.equal(records[0].id, initial.jobId);
+    for (const record of records) for (const field of ["request", "config", "hooks", "lockCmd", "unlockCmd", "developerInstructions"]) assert.equal(Object.hasOwn(record, field), false, field);
+  }
+  assert.equal(cli("sessions", "stop", "private-session").status, "cancelled");
+  const resumed = cli("sessions", "resume", "private-session", "Continue task");
+  assert.equal(resumed.status, "completed");
+  assert.equal(resumed.threadId, initial.threadId);
+  assert.notEqual(resumed.jobId, initial.jobId);
+  assert.ok(!JSON.stringify(resumed).includes(secret));
+  // The secret is excluded from public output, while the next turn still has its config.
+  const { config } = readStoredJob(root, resumed.jobId).request;
+  assert.equal(config.mcp_servers.private.env.TOKEN, secret);
+});
+
+test("cancel reports a pending request while another process owns finalization", () => {
+  const { root, cli } = setup();
+  const job = { id: "task-finalizing", workspaceRoot: root, status: "running", pid: null,
+    finalization: { pid: process.pid, patch: { status: "completed" } } };
+  writeJobFile(root, job.id, job); upsertJob(root, job);
+  const result = cli("cancel", job.id);
+  assert.equal(result.status, "running");
+  assert.equal(result.cancellationRequested, true);
+  assert.equal(readStoredJob(root, job.id).cancelRequested, true);
+  assert.deepEqual(readStoredJob(root, job.id).finalization, job.finalization);
+});
+
+
+test("cancel reports publication failure after the signalled finalizer exits", async t => {
+  const { root, env } = setup();
+  const owner = spawn(process.execPath, ["-e", `
+    process.on('SIGTERM', () => setTimeout(() => process.exit(0), 200));
+    process.stdout.write('ready');
+    setInterval(() => {}, 1000);
+  `], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => { try { owner.kill("SIGKILL"); } catch {} });
+  await once(owner.stdout, "data");
+  const job = { id: "task-exiting-finalizer", workspaceRoot: root, status: "running", pid: owner.pid,
+    resultFile: root, finalization: { pid: owner.pid, patch: { status: "completed" } } };
+  writeJobFile(root, job.id, job); upsertJob(root, job);
+  const cancelling = spawn(process.execPath, [script, "cancel", job.id, "--json"], { cwd: root, env });
+  t.after(() => { try { cancelling.kill("SIGKILL"); } catch {} });
+  let stdout = "", stderr = "";
+  cancelling.stdout.on("data", chunk => { stdout += chunk; });
+  cancelling.stderr.on("data", chunk => { stderr += chunk; });
+  const [exitCode] = await once(cancelling, "close");
+  assert.equal(exitCode, 1, stderr + stdout);
+  const report = JSON.parse(stdout);
+  assert.equal(report.status, "failed");
+  assert.equal(report.error, "result_file_failed");
+  assert.equal(Object.hasOwn(report, "cancellationRequested"), false);
+  assert.equal(readStoredJob(root, job.id).status, "failed");
 });

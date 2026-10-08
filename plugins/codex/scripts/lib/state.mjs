@@ -79,11 +79,15 @@ export function loadState(cwd) {
   }
 }
 
+export function hasPendingJobRecovery(job) {
+  return Boolean(job.finalization || (job.terminalDelivery && !job.terminalDelivery.delivered) || job.lockAcquired || (job.externalLock && job.externalLock.state !== "released"));
+}
+
 function pruneJobs(jobs) {
   const sorted = [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
   let historyCount = 0;
   return sorted.filter((job) => {
-    if (job.persistent || job.name || ["queued", "running", "awaiting-answer"].includes(job.status)) return true;
+    if (hasPendingJobRecovery(job) || job.persistent || job.name || ["queued", "running", "awaiting-answer"].includes(job.status)) return true;
     return historyCount++ < MAX_JOBS;
   });
 }

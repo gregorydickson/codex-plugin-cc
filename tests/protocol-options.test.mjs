@@ -9,7 +9,7 @@ import { resolveRuntimeOptions } from "../plugins/codex/scripts/lib/runtime-opti
 import { installFakeCodex, buildEnv } from "./fake-codex-fixture.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
-function setup(t, notifications = [], finalMessage = '{"ok":true}') {
+function setup(t, notifications = [], finalMessage = '{"ok":true}', controls = {}) {
   const dir = makeTempDir();
   installFakeCodex(dir);
   const oldPath = process.env.PATH;
@@ -22,14 +22,16 @@ function setup(t, notifications = [], finalMessage = '{"ok":true}') {
     close: async () => {},
     async request(method, params) {
       requests.push({ method, params });
+      if (controls.request && ["thread/read", "turn/interrupt"].includes(method)) return controls.request(method, params);
       if (method === "thread/start" || method === "thread/resume") return { thread: { id: "thread" } };
       if (method === "turn/start" || method === "review/start") {
         queueMicrotask(() => {
           for (const message of notifications) this.notificationHandler?.(message);
+          if (controls.complete === false) return;
           this.notificationHandler?.({ method: "item/completed", params: { threadId: "thread", turnId: "turn", item: { type: "agentMessage", text: finalMessage } } });
           this.notificationHandler?.({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed" } } });
         });
-        return { turn: { id: "turn", status: "inProgress" } };
+        return controls.startResponse ?? { turn: { id: "turn", status: "inProgress" } };
       }
       return {};
     }
@@ -136,3 +138,134 @@ test("pause schema rejects unsafe reference scopes and preserves literal data wi
   const schema = { type: "object", properties: { $id: { type: "string" }, value: { const: { $ref: "literal" } } } };
   assert.deepEqual(buildPauseOutputSchema(schema).properties.result.anyOf[0], schema);
 });
+
+const collaboration = (receivers, threadId = "thread", turnId = "turn") => ({ method: "item/completed", params: { threadId, turnId, item: { type: "collabAgentToolCall", id: `spawn-${receivers.join("-")}`, tool: "spawnAgent", status: "completed", receiverThreadIds: receivers } } });
+const childStarted = id => ({ method: "turn/started", params: { threadId: id, turn: { id: `turn-${id}`, status: "inProgress" } } });
+const childResult = id => ({ method: "item/completed", params: { threadId: id, turnId: `turn-${id}`, item: { type: "agentMessage", text: `result-${id}`, phase: "final_answer" } } });
+const childCompleted = id => ({ method: "turn/completed", params: { threadId: id, turn: { id: `turn-${id}`, status: "completed" } } });
+function completedPair() {
+  return [collaboration(["a", "b"]), childStarted("a"), childResult("a"), childCompleted("a"), childStarted("b"), childResult("b"), childCompleted("b")];
+}
+
+test("fanout counts replacement identities cumulatively and interrupts excess work before parent completion", async t => {
+  const notifications = [...completedPair(), collaboration(["a"]), collaboration(["replacement"]), childStarted("replacement")];
+  const { dir, requests } = setup(t, notifications, "unused", { complete: false });
+  await assert.rejects(runAppServerTurn(dir, { prompt: "delegate", fanout: 2 }), error => {
+    assert.equal(error.code, "fanout_limit_exceeded");
+    assert.deepEqual(error.childThreadIds, ["a", "b", "replacement"]);
+    return true;
+  });
+  assert.deepEqual(requests.filter(r => r.method === "turn/interrupt").map(r => r.params), [
+    { threadId: "thread", turnId: "turn" }, { threadId: "replacement", turnId: "turn-replacement" }
+  ]);
+});
+
+test("fanout detects nested delegation and reads an as-yet unobserved child turn for interruption", async t => {
+  const notifications = [collaboration(["a"]), childStarted("a"), collaboration(["nested"], "a", "turn-a")];
+  const { dir, requests } = setup(t, notifications, "unused", { complete: false, request(method, params) {
+    if (method === "thread/read") return { thread: { id: params.threadId, turns: [{ id: "nested-turn", status: "inProgress" }] } };
+    return {};
+  } });
+  await assert.rejects(runAppServerTurn(dir, { prompt: "delegate", fanout: 1 }), { code: "fanout_limit_exceeded" });
+  assert.deepEqual(requests.filter(r => r.method === "thread/read").map(r => r.params), [{ threadId: "nested", includeTurns: true }]);
+  assert.deepEqual(requests.filter(r => r.method === "turn/interrupt").map(r => r.params).sort((a,b) => a.threadId.localeCompare(b.threadId)), [
+    { threadId: "a", turnId: "turn-a" }, { threadId: "nested", turnId: "nested-turn" }, { threadId: "thread", turnId: "turn" }
+  ]);
+});
+
+test("fanout completion requires results for every observed child identity", async t => {
+  const { dir, requests } = setup(t, [collaboration(["a", "b"]), childStarted("a"), childResult("a"), childCompleted("a"), childStarted("b")]);
+  await assert.rejects(runAppServerTurn(dir, { prompt: "delegate", fanout: 2 }), error => {
+    assert.equal(error.code, "fanout_incomplete");
+    assert.deepEqual(error.childThreadIds, ["a", "b"]);
+    assert.deepEqual(error.children, [{ threadId: "a", finalMessage: "result-a" }]);
+    return true;
+  });
+  assert.ok(requests.some(r => r.method === "turn/interrupt" && r.params.threadId === "b" && r.params.turnId === "turn-b"));
+});
+
+test("fanout accepts exactly two unique children despite repeated collaboration references", async t => {
+  const { dir } = setup(t, [...completedPair(), collaboration(["a", "b"])]);
+  const result = await runAppServerTurn(dir, { prompt: "delegate", fanout: 2 });
+  assert.deepEqual(result.children, [{ threadId: "a", finalMessage: "result-a" }, { threadId: "b", finalMessage: "result-b" }]);
+});
+
+test("plain tasks retain their existing unrestricted subagent capture", async t => {
+  const { dir, requests } = setup(t, [...completedPair(), collaboration(["replacement"]), childStarted("replacement")]);
+  const result = await runAppServerTurn(dir, { prompt: "delegate" });
+  assert.equal(result.status, 0);
+  assert.deepEqual(result.children, [{ threadId: "a", finalMessage: "result-a" }, { threadId: "b", finalMessage: "result-b" }]);
+  assert.deepEqual(requests.filter(r => r.method === "turn/interrupt"), []);
+});
+
+test("fanout failure survives rejected and hung interruption RPCs without hanging capture", { timeout: 5000 }, async t => {
+  const { dir } = setup(t, [collaboration(["a", "b"]), childStarted("a"), childStarted("b")], "unused", { complete: false, request(method, params) {
+    if (params.threadId === "a") return new Promise(() => {});
+    throw new Error("transport rejected cleanup");
+  } });
+  await assert.rejects(runAppServerTurn(dir, { prompt: "delegate", fanout: 1 }), { code: "fanout_limit_exceeded" });
+});
+
+
+test("malformed start response rejects before replaying buffered notifications", async t => {
+  const { dir, client } = setup(t, [{ method: "thread/name/updated", params: { threadId: "thread", threadName: "buffered" } }], "unused", {
+    complete: false, startResponse: { turn: { status: "inProgress" } }
+  });
+  await assert.rejects(runAppServerTurn(dir, { prompt: "hello" }), error => {
+    assert.equal(error.code, "codex_protocol_error");
+    assert.match(error.message, /without a valid turn id/);
+    return true;
+  });
+  assert.equal(client.notificationHandler, null);
+});
+
+
+for (const scenario of ["active-final", "active-commentary", "completed-commentary", "failed-final"]) {
+  test(`fanout rejects a child without a successfully completed final answer (${scenario})`, async t => {
+    const message = childResult("a");
+    if (scenario.endsWith("commentary")) message.params.item.phase = "commentary";
+    const notifications = [collaboration(["a"]), childStarted("a"), message];
+    if (scenario.startsWith("completed")) notifications.push(childCompleted("a"));
+    if (scenario.startsWith("failed")) {
+      const failed = childCompleted("a"); failed.params.turn.status = "failed"; notifications.push(failed);
+    }
+    const { dir, requests } = setup(t, notifications);
+    await assert.rejects(runAppServerTurn(dir, { prompt: "delegate", fanout: 1 }), error => {
+      assert.equal(error.code, "fanout_incomplete");
+      assert.deepEqual(error.children, []);
+      assert.deepEqual(error.childThreadIds, ["a"]);
+      return true;
+    });
+    if (scenario.startsWith("active")) assert.ok(requests.some(r => r.method === "turn/interrupt" && r.params.threadId === "a" && r.params.turnId === "turn-a"));
+  });
+}
+
+test("fanout accepts phase-less compatibility output only after successful child completion", async t => {
+  const message = childResult("a"); message.params.item.phase = null;
+  const { dir } = setup(t, [collaboration(["a"]), childStarted("a"), message, childCompleted("a")]);
+  const result = await runAppServerTurn(dir, { prompt: "delegate", fanout: 1 });
+  assert.deepEqual(result.children, [{ threadId: "a", finalMessage: "result-a" }]);
+});
+
+for (const completeNewTurn of [false, true]) {
+  test(`fanout discards old results when a known child starts another turn (complete=${completeNewTurn})`, async t => {
+    const newTurn = childStarted("a"); newTurn.params.turn.id = "turn-a-new";
+    const staleMessage = childResult("a"); staleMessage.params.item.text = "late stale result";
+    const notifications = [collaboration(["a"]), childStarted("a"), childResult("a"), childCompleted("a"), newTurn, staleMessage, childCompleted("a")];
+    if (completeNewTurn) {
+      const final = childResult("a"); final.params.turnId = "turn-a-new"; final.params.item.text = "new result";
+      const completed = childCompleted("a"); completed.params.turn.id = "turn-a-new";
+      notifications.push(final, completed);
+    }
+    const { dir, requests } = setup(t, notifications);
+    if (completeNewTurn) {
+      const result = await runAppServerTurn(dir, { prompt: "delegate", fanout: 1 });
+      assert.deepEqual(result.children, [{ threadId: "a", finalMessage: "new result" }]);
+    } else {
+      await assert.rejects(runAppServerTurn(dir, { prompt: "delegate", fanout: 1 }), error => {
+        assert.equal(error.code, "fanout_incomplete"); assert.deepEqual(error.children, []); return true;
+      });
+      assert.ok(requests.some(r => r.method === "turn/interrupt" && r.params.threadId === "a" && r.params.turnId === "turn-a-new"));
+    }
+  });
+}

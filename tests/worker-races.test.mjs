@@ -71,7 +71,7 @@ test("cancellation claims terminal state before the watchdog observes the killed
     while (!fs.existsSync(${JSON.stringify(killed)})) await new Promise(resolve => setTimeout(resolve, 10));
     fs.writeFileSync(${JSON.stringify(observed)}, 'observed');
     const result = await finalizeTrackedJob(${JSON.stringify(cwd)}, 'cancel-race', {status:'orphaned'}, {expectedOwnerPid:${sleeper.pid}});
-    process.stdout.write(result.status);
+    process.stdout.write(JSON.stringify({ status: result.status, cancelRequested: result.cancelRequested, finalizingStatus: result.finalization?.patch?.status }));
   `], { cwd, stdio: ["ignore", "pipe", "pipe"] });
   t.after(() => { try { watcher.kill("SIGKILL"); } catch {} });
   let output = ""; let errors = "";
@@ -93,7 +93,10 @@ test("cancellation claims terminal state before the watchdog observes the killed
   });
   const [code] = await watcherExit;
   assert.equal(code, 0, errors);
-  assert.equal(output, "cancelled");
+  const observation = JSON.parse(output);
+  assert.ok(["running", "cancelled"].includes(observation.status));
+  assert.equal(observation.cancelRequested, true);
+  if (observation.status === "running") assert.equal(observation.finalizingStatus, "cancelled");
   assert.equal(completed.status, "cancelled");
   assert.equal(loadState(cwd).jobs[0].status, "cancelled");
   assert.equal(JSON.parse(fs.readFileSync(resultFile, "utf8")).status, "cancelled");
