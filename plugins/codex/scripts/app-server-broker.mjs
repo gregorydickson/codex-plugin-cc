@@ -8,7 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
-import { clearBrokerSession, loadBrokerSession } from "./lib/broker-lifecycle.mjs";
+import { clearOwnedBrokerSession } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -130,10 +130,7 @@ async function main() {
       if (pidFile && fs.existsSync(pidFile)) {
         fs.unlinkSync(pidFile);
       }
-      const session = loadBrokerSession(cwd);
-      if (session?.pid === process.pid && session.endpoint === endpoint) {
-        clearBrokerSession(cwd);
-      }
+      await clearOwnedBrokerSession(cwd, { pid: process.pid, endpoint });
     })();
     return shutdownPromise;
   }

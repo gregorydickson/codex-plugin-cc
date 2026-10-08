@@ -320,3 +320,7 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+## Orchestrating Codex workers
+
+The companion supports opt-in typed background results, named persistent sessions, steering, pause-and-answer, per-call MCP/profile configuration, worktree locks, lifecycle notifications, comparison and claim-verification commands, usage accounting, and supported Codex subagent fan-out. See the [worker CLI guide](plugins/codex/docs/workers.md) and the schema-returning [`codex:codex-worker` agent](plugins/codex/agents/codex-worker.md).

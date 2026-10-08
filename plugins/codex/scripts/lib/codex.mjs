@@ -28,6 +28,9 @@
  *   reviewText: string,
  *   reasoningSummary: string[],
  *   error: unknown,
+ *   usage: any,
+ *   usageBaseline: any,
+ *   children: Map<string, any>,
  *   messages: Array<{ lifecycle: string, phase: string | null, text: string }>,
  *   fileChanges: ThreadItem[],
  *   commandExecutions: ThreadItem[],
@@ -67,6 +70,8 @@ function buildThreadParams(cwd, options = {}) {
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
     serviceName: SERVICE_NAME,
+    ...(options.config ? { config: options.config } : {}),
+    ...(options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}),
     ephemeral: options.ephemeral ?? true
   };
 }
@@ -78,7 +83,9 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox: options.sandbox ?? "read-only",
+    ...(options.config ? { config: options.config } : {}),
+    ...(options.developerInstructions ? { developerInstructions: options.developerInstructions } : {})
   };
 }
 
@@ -307,6 +314,7 @@ function createTurnCaptureState(threadId, options = {}) {
     resolveCompletion = resolve;
     rejectCompletion = reject;
   });
+  void completion.catch(() => {});
 
   return {
     threadId,
@@ -329,6 +337,9 @@ function createTurnCaptureState(threadId, options = {}) {
     reviewText: "",
     reasoningSummary: [],
     error: null,
+    usage: null,
+    usageBaseline: null,
+    children: new Map(),
     messages: [],
     fileChanges: [],
     commandExecutions: [],
@@ -425,6 +436,9 @@ function recordItem(state, item, lifecycle, threadId = null) {
       text: item.text ?? ""
     });
     if (item.text) {
+      if (threadId && threadId !== state.threadId && lifecycle === "completed") {
+        state.children.set(threadId, { threadId, finalMessage: item.text });
+      }
       if (!threadId || threadId === state.threadId) {
         state.lastAgentMessage = item.text;
         if (lifecycle === "completed" && item.phase === "final_answer") {
@@ -534,7 +548,17 @@ function applyTurnNotification(state, message) {
         emitProgress(state.onProgress, update?.message, update?.phase ?? null);
       }
       break;
+    case "thread/tokenUsage/updated":
+      if (message.params.threadId === state.threadId) {
+        const { total, last } = message.params.tokenUsage;
+        if (!state.usageBaseline) state.usageBaseline = Object.fromEntries(Object.entries(total).map(([key, value]) => [key, value - (last[key] ?? 0)]));
+        state.usage = Object.fromEntries(Object.entries(total).map(([key, value]) => [key, Math.max(0, value - (state.usageBaseline[key] ?? 0))]));
+      }
+      break;
     case "error":
+      if (isQuotaError(message.params.error)) {
+        state.rejectCompletion(createQuotaError(message.params.error));
+      }
       state.error = message.params.error;
       emitProgress(state.onProgress, `Codex error: ${message.params.error.message}`, "failed");
       break;
@@ -603,7 +627,9 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    return await Promise.race([state.completion, client.exitPromise.then(() => {
+      throw client.exitError ?? new Error("Codex app-server disconnected before the turn completed.");
+    })]);
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
@@ -629,12 +655,14 @@ async function withAppServer(cwd, fn) {
     }
 
     if (!shouldRetryDirect) {
-      throw error;
+      throw isQuotaError(error) ? createQuotaError(error) : error;
     }
 
     const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
     try {
       return await fn(directClient);
+    } catch (error) {
+      throw isQuotaError(error) ? createQuotaError(error) : error;
     } finally {
       await directClient.close();
     }
@@ -752,6 +780,8 @@ async function resumeThread(client, threadId, cwd, options = {}) {
 }
 
 function buildResultStatus(turnState) {
+  const error = turnState.error ?? turnState.finalTurn?.error;
+  if (isQuotaError(error)) throw createQuotaError(error);
   return turnState.finalTurn?.status === "completed" ? 0 : 1;
 }
 
@@ -1005,9 +1035,20 @@ export async function runAppServerReview(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
+  if (options.outputSchema) {
+    const result = await runAppServerTurn(cwd, {
+      ...options,
+      sandbox: "read-only",
+      prompt: `Review code changes for correctness, regressions, security, and missing tests. Return only the requested JSON schema. Review target: ${JSON.stringify(options.target)}. Do not modify files.`
+    });
+    return { ...result, reviewText: result.finalMessage, sourceThreadId: result.threadId };
+  }
+
   return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
+      ...options,
+      config: { ...options.config, ...(options.effort ? { model_reasoning_effort: options.effort } : {}) },
       model: options.model,
       sandbox: "read-only",
       ephemeral: true,
@@ -1037,9 +1078,15 @@ export async function runAppServerReview(cwd, options = {}) {
               state.threadId = response.reviewThreadId;
             }
           }
+          options.onActiveTurn?.({ threadId: state.threadId, turnId: response.turn.id,
+            send: (message) => client.request("turn/steer", {
+              threadId: state.threadId, expectedTurnId: response.turn.id, input: buildTurnInput(message)
+            })
+          });
         }
       }
     );
+    validateFanout(turnState, options.fanout);
 
     return {
       status: buildResultStatus(turnState),
@@ -1047,9 +1094,11 @@ export async function runAppServerReview(cwd, options = {}) {
       sourceThreadId,
       turnId: turnState.turnId,
       reviewText: turnState.reviewText,
+      usage: turnState.usage,
+      children: [...turnState.children.values()],
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
-      error: turnState.error,
+      error: turnState.error ?? turnState.finalTurn?.error ?? null,
       stderr: cleanCodexStderr(client.stderr)
     };
   });
@@ -1104,6 +1153,7 @@ export async function runAppServerTurn(cwd, options = {}) {
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
+        ...options,
         model: options.model,
         sandbox: options.sandbox,
         ephemeral: false
@@ -1112,6 +1162,7 @@ export async function runAppServerTurn(cwd, options = {}) {
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {
+        ...options,
         model: options.model,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
@@ -1124,10 +1175,12 @@ export async function runAppServerTurn(cwd, options = {}) {
       threadId
     });
 
-    const prompt = options.prompt?.trim() || options.defaultPrompt || "";
+    let prompt = options.prompt?.trim() || options.defaultPrompt || "";
     if (!prompt) {
       throw new Error("A prompt is required for this Codex run.");
     }
+    const pauseSchema = options.pauseAndAsk && options.outputSchema ? buildPauseOutputSchema(options.outputSchema) : null;
+    if (pauseSchema) prompt += `\n\nReturn the required transport object. If finished, set state to "completed", put your requested-schema answer in result, set question and draftAnswer to null, and use empty facts/itemsHeld arrays. If a decision is missing, set state to "awaiting-answer", result to null, provide question/draftAnswer and evidence facts/itemsHeld. Do not use the stop-report shape outside this transport object.`;
 
     const turnState = await captureTurn(
       client,
@@ -1138,19 +1191,36 @@ export async function runAppServerTurn(cwd, options = {}) {
           input: buildTurnInput(prompt),
           model: options.model ?? null,
           effort: options.effort ?? null,
-          outputSchema: options.outputSchema ?? null
+          outputSchema: pauseSchema ?? options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      { onProgress: options.onProgress, onResponse(response) {
+        options.onActiveTurn?.({ threadId, turnId: response.turn.id,
+          send: (message) => client.request("turn/steer", {
+            threadId, expectedTurnId: response.turn.id, input: buildTurnInput(message)
+          })
+        });
+      } }
     );
 
+    let awaitingAnswer = false;
+    if (pauseSchema && turnState.finalTurn?.status === "completed") {
+      const decoded = unwrapPauseOutput(turnState.lastAgentMessage);
+      turnState.lastAgentMessage = decoded.rawOutput;
+      awaitingAnswer = decoded.awaitingAnswer;
+    } else if (options.pauseAndAsk) {
+      try { awaitingAnswer = JSON.parse(turnState.lastAgentMessage)?.state === "awaiting-answer"; } catch {}
+    }
+    if (!awaitingAnswer) validateFanout(turnState, options.fanout);
     return {
       status: buildResultStatus(turnState),
       threadId,
       turnId: turnState.turnId,
       finalMessage: turnState.lastAgentMessage,
+      usage: turnState.usage,
+      children: [...turnState.children.values()],
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
-      error: turnState.error,
+      error: turnState.error ?? turnState.finalTurn?.error ?? null,
       stderr: cleanCodexStderr(client.stderr),
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
@@ -1217,3 +1287,82 @@ export function readOutputSchema(schemaPath) {
 }
 
 export { DEFAULT_CONTINUE_PROMPT, TASK_THREAD_PREFIX };
+
+/** Quota exhaustion is terminal; transient rate limiting is not quota exhaustion. */
+export function isQuotaError(error) {
+  const code = error?.codexErrorInfo ?? error?.data?.codexErrorInfo ?? error?.data?.error?.codexErrorInfo;
+  return code === "usageLimitExceeded" || code === "sessionBudgetExceeded" ||
+    error?.code === "quota_exhausted" || /\b(insufficient_quota|quota exhausted|usage limit exceeded)\b/i.test(error?.message ?? "");
+}
+
+export function createQuotaError(source) {
+  return Object.assign(new Error(source?.message ?? "Codex quota exhausted."), {
+    code: "quota_exhausted", error: "quota_exhausted", exitCode: 75,
+    retryAfter: source?.retryAfter ?? source?.data?.retryAfter ?? null
+  });
+}
+
+export async function sendAppServerTurn(cwd, { threadId, turnId, message }) {
+  if (!threadId || !turnId || !String(message ?? "").trim()) throw new Error("An active thread, turn, and message are required.");
+  const broker = loadBrokerSession(cwd);
+  if (!broker?.endpoint) throw new Error("The active turn is not attached to a reachable broker; use the worker control channel.");
+  const client = await CodexAppServerClient.connect(cwd, { brokerEndpoint: broker.endpoint, reuseExistingBroker: true });
+  try {
+    await client.request("turn/steer", { threadId, expectedTurnId: turnId, input: buildTurnInput(message) });
+    return { accepted: true, threadId, turnId };
+  } finally { await client.close(); }
+}
+
+function validateFanout(state, requested) {
+  if (requested && state.finalTurn?.status === "completed" && state.children.size !== Number(requested)) {
+    throw Object.assign(new Error(`Codex returned ${state.children.size} child results; --fanout requested ${requested}. The selected model may not support delegation.`), {
+      code: "fanout_incomplete", children: [...state.children.values()], requested: Number(requested)
+    });
+  }
+}
+
+/** Embed the caller schema without changing the target of local JSON pointers. */
+export function buildPauseOutputSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) throw new Error("--pause-and-ask with --output-schema requires an object schema.");
+  const schemaMaps = new Set(["properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies"]);
+  const schemaChildren = new Set(["additionalProperties", "unevaluatedProperties", "contains", "not", "if", "then", "else", "propertyNames", "contentSchema", "additionalItems", "unevaluatedItems", "items"]);
+  const schemaLists = new Set(["allOf", "anyOf", "oneOf", "prefixItems"]);
+  function relocate(value) {
+    if (Array.isArray(value)) return value.map(relocate);
+    if (!value || typeof value !== "object") return value;
+    const copy = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (["$id", "$anchor", "$dynamicRef", "$dynamicAnchor", "$recursiveRef", "$recursiveAnchor"].includes(key)) {
+        throw new Error(`--pause-and-ask cannot safely wrap a schema using ${key}; use a self-contained schema with local JSON-pointer references.`);
+      }
+      if (key === "$ref") {
+        if (typeof entry !== "string" || (entry !== "#" && !entry.startsWith("#/"))) throw new Error("--pause-and-ask schemas must use local JSON-pointer references, not external or anchor references.");
+        copy[key] = `#/properties/result/anyOf/0${entry.slice(1)}`;
+      } else if (schemaMaps.has(key) && entry && typeof entry === "object") {
+        copy[key] = Object.fromEntries(Object.entries(entry).map(([name, child]) => [name, relocate(child)]));
+      } else if (schemaChildren.has(key) || schemaLists.has(key)) copy[key] = relocate(entry);
+      else if (key !== "$schema") copy[key] = entry;
+    }
+    return copy;
+  }
+  return {
+    type: "object", additionalProperties: false,
+    required: ["state", "result", "question", "draftAnswer", "facts", "itemsHeld"],
+    properties: {
+      state: { type: "string", enum: ["completed", "awaiting-answer"] },
+      result: { anyOf: [relocate(schema), { type: "null" }] },
+      question: { type: ["string", "null"] }, draftAnswer: { type: ["string", "null"] },
+      facts: { type: "array", items: { type: "string" } }, itemsHeld: { type: "array", items: { type: "string" } }
+    }
+  };
+}
+
+function unwrapPauseOutput(rawOutput) {
+  let value;
+  try { value = JSON.parse(rawOutput); } catch { throw new Error("Codex returned an invalid pause-and-ask transport object."); }
+  if (!value || !["completed", "awaiting-answer"].includes(value.state) || !("result" in value)) throw new Error("Codex returned an invalid pause-and-ask transport object.");
+  if (value.state === "completed") return { rawOutput: JSON.stringify(value.result), awaitingAnswer: false };
+  if (typeof value.question !== "string" || !value.question.trim() || !Array.isArray(value.facts) || !Array.isArray(value.itemsHeld)) throw new Error("Codex returned an incomplete stop report.");
+  const { result, ...report } = value;
+  return { rawOutput: JSON.stringify(report), awaitingAnswer: true };
+}
