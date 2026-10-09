@@ -857,8 +857,16 @@ async function startThread(client, cwd, options = {}) {
   return response;
 }
 
+// A shared broker releases a finished job's thread; Codex rejects a resume while it is closing.
 async function resumeThread(client, threadId, cwd, options = {}) {
-  return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await client.request("thread/resume", buildResumeParams(threadId, cwd, options));
+    } catch (error) {
+      if (attempt >= 40 || !/is closing; retry/.test(error?.message ?? "")) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
 }
 
 function buildResultStatus(turnState) {

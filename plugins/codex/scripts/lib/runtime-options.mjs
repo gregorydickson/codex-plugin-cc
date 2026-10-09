@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { parseToml } from "../vendor/runtime-deps.mjs";
 
 function readConfig(file) {
@@ -24,9 +24,42 @@ function supportsFeature(name, cwd) {
   return result.status === 0 && result.stdout.split(/\r?\n/).some((line) => line.startsWith(`${name} `));
 }
 
+function realpathOrResolved(file) {
+  try { return fs.realpathSync(file); } catch { return path.resolve(file); }
+}
+
+function linkedWorktreeGitDir(cwd) {
+  try {
+    const [gitDir, commonDir] = execFileSync("git", ["rev-parse", "--absolute-git-dir", "--git-common-dir"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split(/\r?\n/);
+    const own = fs.realpathSync(gitDir);
+    return own === realpathOrResolved(path.resolve(cwd, commonDir)) ? null : own;
+  } catch { return null; }
+}
+
+/**
+ * Codex keeps a linked worktree's own gitdir (<repo>/.git/worktrees/<name>) read-only
+ * even inside a granted writable root, so a granted repository .git still cannot
+ * take a commit. When a granted root already contains that gitdir, name it
+ * explicitly; a root that does not contain it grants nothing new.
+ */
+function withLinkedGitDir(cwd, roots) {
+  const gitDir = Array.isArray(roots) && roots.length ? linkedWorktreeGitDir(cwd) : null;
+  if (!gitDir) return null;
+  const relations = roots.map(root => path.relative(realpathOrResolved(path.resolve(cwd, root)), gitDir));
+  if (!relations.some(relation => !relation.startsWith("..") && !path.isAbsolute(relation))) return null;
+  return [...roots, gitDir];
+}
+
 /** Resolve opt-in profiles without mutating the user's Codex configuration. */
 export function resolveRuntimeOptions(cwd, options = {}) {
-  if (!options.profile && !options.mcpConfig && !options.fanout) return {};
+  if (!options.profile && !options.mcpConfig && !options.fanout) {
+    if (!options.write) return {};
+    const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+    const userConfigPath = path.join(codexHome, "config.toml");
+    const roots = fs.existsSync(userConfigPath) ? withLinkedGitDir(cwd, readConfig(userConfigPath).sandbox_workspace_write?.writable_roots) : null;
+    // A dotted key extends the user's table instead of replacing it.
+    return roots ? { config: { "sandbox_workspace_write.writable_roots": roots } } : {};
+  }
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
   const userConfigPath = path.join(codexHome, "config.toml");
   const userConfig = fs.existsSync(userConfigPath) ? readConfig(userConfigPath) : {};
@@ -76,5 +109,11 @@ export function resolveRuntimeOptions(cwd, options = {}) {
   delete config.sandbox;
   if (sandbox && !["read-only", "workspace-write", "danger-full-access"].includes(sandbox)) throw new Error(`Unsupported sandbox profile: ${sandbox}`);
   if (allowlist !== undefined && sandbox === "danger-full-access") throw new Error("Network allow-lists require a sandboxed profile.");
+  if (sandbox === "workspace-write") {
+    const granted = config.sandbox_workspace_write?.writable_roots ?? userConfig.sandbox_workspace_write?.writable_roots;
+    const roots = withLinkedGitDir(cwd, granted);
+    if (roots && config.sandbox_workspace_write) config.sandbox_workspace_write.writable_roots = roots;
+    else if (roots) config["sandbox_workspace_write.writable_roots"] = roots;
+  }
   return { config, ...(sandbox ? { sandbox } : {}), activeServers: activeServers.sort(), effectiveProfile: options.profile ? { name: options.profile, sandbox: sandbox ?? "read-only", activeServers: activeServers.sort(), networkAllowlist: allowlist ?? null } : null };
 }

@@ -75,6 +75,9 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  // The shared app-server keeps every thread this connection subscribed to loaded,
+  // MCP server processes included, until the thread is unsubscribed.
+  const threadOwners = new Map();
   let idleTimer = null;
   let shutdownPromise = null;
 
@@ -97,11 +100,26 @@ async function main() {
     }
   }
 
+  function claimThread(socket, threadId) {
+    if (!socket || typeof threadId !== "string") return;
+    if (!threadOwners.has(threadId)) threadOwners.set(threadId, new Set());
+    threadOwners.get(threadId).add(socket);
+  }
+
+  async function releaseThreads(socket) {
+    for (const [threadId, owners] of threadOwners) {
+      if (!owners.delete(socket) || owners.size > 0) continue;
+      threadOwners.delete(threadId);
+      if (!shutdownPromise) await appClient.request("thread/unsubscribe", { threadId }).catch(() => {});
+    }
+  }
+
   function routeNotification(message) {
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
     }
+    if (message.method === "thread/started") claimThread(target, message.params?.thread?.id);
     send(target, message);
     if (message.method === "turn/completed" && activeStreamSocket === target) {
       const threadId = message.params?.threadId ?? null;
@@ -226,6 +244,8 @@ async function main() {
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
+          claimThread(socket, result?.thread?.id);
+          claimThread(socket, result?.reviewThreadId);
           send(socket, { id: message.id, result });
           if (isStreaming) {
             activeStreamSocket = socket;
@@ -252,12 +272,14 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      void releaseThreads(socket);
       scheduleIdleShutdown();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      void releaseThreads(socket);
     });
   });
 

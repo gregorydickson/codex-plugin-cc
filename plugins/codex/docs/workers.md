@@ -33,6 +33,22 @@ node "$C" sessions stop audit --json
 
 Steering is acknowledged only after Codex accepts it against the currently active turn. A completed or unavailable turn cannot accept a message. `sessions resume` starts a new job record on the same Codex thread; collect the returned new job ID. Answering a paused job retains its job ID and thread. Stopped named sessions can be resumed after cancellation has finished.
 
+### What a resume inherits
+
+`sessions resume NAME`, `task --resume-last`, and `answer` continue the original job with its recorded options, so a later slice does not need a new name or thread:
+
+- **Inherited:** `--write` (and the sandbox it selects), `--worktree`, `--lock-cmd`/`--unlock-cmd`, `--profile`, `--mcp-config`, `--instructions`, `--output-schema`, `--pause-and-ask`, `--fanout`, `--notify-socket`, the `--on-*` hooks, `--model`, and `--effort`. Profile, MCP, and instruction files are read again when the new turn starts.
+- **Not inherited:** `--brief` and `--preread` are input for one turn. The thread already holds the previous slice's input, so pass a new `--brief`/`--preread` with the resume when the next slice needs one.
+- **Overrides:** `sessions resume` and `task --resume-last` accept the same worker flags as `task`; an explicit flag replaces the inherited value. A resume cannot change the session's `--worktree` or `--name`. `answer` is the same job and always keeps its options unchanged.
+- **Result files:** a literal `--result-file` path belongs to the job that wrote it. `answer` publishes to the paused job's file, but a resume that starts a new job never overwrites the previous slice's file. Pass `--result-file` on the resume to publish the new job. A path containing `{jobId}` (for example `results/{jobId}.json`) is a pattern: it is inherited and expanded with each job's ID, so every slice publishes to its own file.
+
+```sh
+node "$C" sessions resume card-12 --brief slice-2.md --result-file r2.json --background --json
+node "$C" task --resume-last --worktree /absolute/worktree/root "Address the review findings" --json
+```
+
+Sessions recorded by an earlier plugin version resume with their stored options, but do not accept override flags and do not carry over a result file.
+
 `task --pause-and-ask` adds a brief contract: when blocked on a decision, the worker returns `{question, draftAnswer, facts, itemsHeld, state:"awaiting-answer"}`. Facts use `path:line@sha` references. The job pauses and emits `stop-report`. Resume with `answer JOB_OR_NAME "answer text"`, or `answer JOB_OR_NAME --file answer.txt`. With `--output-schema`, the runtime wraps the caller schema in an internal object transport so the model can return either a completed result or a stop report. Completed output is unwrapped and validated against the original schema; a stop report is separate from completion validation. Local JSON-pointer references are relocated safely; external references, schema IDs, and anchors are rejected for this combination. Review commands do not accept `--pause-and-ask`.
 
 ## Context and controlled writes
@@ -45,7 +61,9 @@ node "$C" task --write --worktree /absolute/worktree/root \
   --brief fix.md --instructions AGENTS.md --preread src/example.ts --json
 ```
 
-`--worktree` must name a Git worktree root. `--lock-cmd` requires `--unlock-cmd`; a failing lock aborts execution. Acquisition intent is persisted before the command runs. Both commands receive `CODEX_JOB_LOCK_TOKEN` (unique to that work segment), `CODEX_JOB_OWNER_PID`, and `CODEX_JOB_WORKTREE`.
+`--worktree` must name a Git worktree root. A linked worktree keeps its Git metadata in `<repo>/.git/worktrees/<name>`, and Codex keeps that directory read-only even when a writable root contains it, so `git add`/`git commit` fail on `index.lock`. When a job runs with a `workspace-write` sandbox in a linked worktree and a granted writable root (from the profile or `config.toml` `sandbox_workspace_write.writable_roots`) already contains that directory, the companion lists the directory as its own writable root. A worker can only commit if the profile grants the repository's `.git`. The companion never adds a root that the configured roots do not already cover.
+
+`--lock-cmd` requires `--unlock-cmd`; a failing lock aborts execution. Acquisition intent is persisted before the command runs. Both commands receive `CODEX_JOB_LOCK_TOKEN` (unique to that work segment), `CODEX_JOB_OWNER_PID`, and `CODEX_JOB_WORKTREE`.
 
 Lock commands must implement a token-aware protocol: acquisition atomically records the token, and release is idempotent, releases only that token's ownership, and cancels a pending acquisition even if it has not completed. Fence late acquisition by a surviving shell child using a released-token tombstone or an equivalent lock service guarantee. A bare `rm lockfile` is not a safe recovery protocol. Release can be replayed after a crash or failure; it must never release another worker's lock.
 
@@ -56,6 +74,8 @@ Lock commands must implement a token-aware protocol: acquisition atomically reco
 `--profile NAME` selects `profiles.NAME` from `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) or `$CODEX_HOME/NAME.config.toml`. Profiles can provide native Codex configuration, including `sandbox_mode` and `mcp_servers`. An explicit profile sandbox takes precedence over `--write`. Unknown profiles fail before execution.
 
 `--mcp-config FILE` accepts TOML with an `[mcp_servers.NAME]` table, or JSON with an `mcp_servers`/`mcpServers` object. It replaces the known inherited server selection for this call: omitted inherited servers are disabled, provided servers are passed as thread configuration. An empty object disables known inherited servers. Result envelopes record selected server names and the effective profile. Private job files also retain the resolved configuration needed to run or resume the job; protect the plugin state directory as credential-bearing data. Public status/session output uses a metadata allowlist and excludes resolved configuration, requests, and executable hook/lock commands. Existing servers supplied by plugin/enterprise layers are subject to Codex's own configuration policy; configuration selection is not proof that a server successfully connected.
+
+Codex starts MCP servers for each loaded thread and keeps them until the thread unloads. The shared broker unsubscribes a job's threads, including subagent threads, when that job disconnects. Codex then unloads them after its idle timeout, so MCP processes from finished jobs do not build up under a long-lived broker. A thread that is still held by another connected job stays loaded. A resume that reaches a thread while Codex is still closing it is retried.
 
 A profile may additionally define `networkAllowlist = ["api.example.com"]` (or `network_allowlist`). This enables Codex's network proxy domain enforcement for sandboxed command traffic and refuses runtimes without the feature. It rejects `danger-full-access` profiles. It does **not** constrain hosted web tools, apps, or MCP server network access. Read-only sandboxing continues to prohibit writes. See the [official network proxy behavior](https://learn.chatgpt.com/docs/agent-approvals-security) and [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 

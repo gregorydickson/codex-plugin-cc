@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { withFileLockSync } from "./file-lock.mjs";
-import { atomicWriteJson, emitJobEvent, resultEnvelope, runJobCommand } from "./job-results.mjs";
+import { atomicWriteJson, emitJobEvent, resultEnvelope, resultFilePath, runJobCommand } from "./job-results.mjs";
 import { snapshotChangedFiles, changedFilesSince, validateWorktree } from "./worktree-jobs.mjs";
 export { resultEnvelope } from "./job-results.mjs";
 
@@ -248,7 +248,7 @@ export async function finalizeTrackedJob(workspaceRoot, jobId, patch, options = 
       completed.schemaValid = envelope.schemaValid;
       completed.parseError = envelope.parseError;
       if (completed.resultFile) {
-        try { atomicWriteJson(completed.resultFile, envelope); }
+        try { atomicWriteJson(resultFilePath(completed), envelope); }
         catch (error) {
           completed.deliveryErrors = [error.message];
           completed.status = "failed"; completed.phase = "failed";
@@ -356,7 +356,7 @@ export async function runTrackedJob(job, runner, options = {}) {
         if (next.unlockError) throw new Error(`Worktree unlock failed: ${next.unlockError}`);
         // Publication shares the transition lock: cancellation can only publish
         // after this envelope, never before a stale pause overwrites it.
-        if (next.resultFile) atomicWriteJson(next.resultFile, resultEnvelope(next));
+        if (next.resultFile) atomicWriteJson(resultFilePath(next), resultEnvelope(next));
         return next;
       });
       if (TERMINAL_STATUSES.has(paused.status)) return finishedExecution(paused, job.structured);

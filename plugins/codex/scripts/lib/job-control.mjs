@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { getConfig, listJobs, listJobsAcrossWorktrees, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { resultFilePath } from "./job-results.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -166,7 +167,7 @@ export function publicJob(job) {
     "startedAt", "completedAt", "cancelledAt", "persistent", "write", "model", "effort",
     "logFile", "resultFile", "worktree", "resumedFrom", "resumedTo", "previousName",
     "schemaValid", "changedFiles", "errorCode", "errorMessage", "retryAfter"];
-  return Object.fromEntries(fields.filter(key => job[key] !== undefined).map(key => [key, job[key]]));
+  return Object.fromEntries(fields.filter(key => job[key] !== undefined).map(key => [key, key === "resultFile" ? resultFilePath(job) : job[key]]));
 }
 
 export function enrichJob(job, options = {}) {

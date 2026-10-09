@@ -139,6 +139,12 @@ function ensureThread(state, threadId) {
   return thread;
 }
 
+function recordThreadRequest(state, message, threadId) {
+  const { sandbox = null, config = null, developerInstructions = null, cwd = null } = message.params;
+  state.threadRequests = [...(state.threadRequests || []), { method: message.method, threadId, sandbox, config, developerInstructions, cwd }];
+  saveState(state);
+}
+
 function nextTurnId(state) {
   const turnId = "turn_" + state.nextTurnId++;
   saveState(state);
@@ -318,6 +324,7 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
+        recordThreadRequest(state, message, thread.id);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-6-astra", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
@@ -350,9 +357,22 @@ rl.on("line", (line) => {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
         const thread = ensureThread(state, message.params.threadId);
+        if (BEHAVIOR === "resume-while-closing" && !state.rejectedClosingResume) {
+          state.rejectedClosingResume = true;
+          saveState(state);
+          throw new Error("thread " + thread.id + " is closing; retry thread/resume after the thread is closed");
+        }
         thread.updatedAt = now();
-        saveState(state);
+        recordThreadRequest(state, message, thread.id);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-6-astra", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        break;
+      }
+
+      case "thread/unsubscribe": {
+        ensureThread(state, message.params.threadId);
+        state.unsubscribed = [...(state.unsubscribed || []), message.params.threadId];
+        saveState(state);
+        send({ id: message.id, result: { status: "unsubscribed" } });
         break;
       }
 
