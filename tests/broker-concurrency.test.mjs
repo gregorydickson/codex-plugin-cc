@@ -188,3 +188,39 @@ test("SessionEnd interrupts its own turn while retaining the shared broker", asy
   assert.deepEqual(loadBrokerSession(cwd), session);
   assert.deepEqual(loadState(cwd).jobs, []);
 });
+
+async function waitForFakeState(bin, predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  let state;
+  while (Date.now() < deadline) {
+    state = JSON.parse(fs.readFileSync(path.join(bin, "fake-codex-state.json"), "utf8"));
+    if (predicate(state)) return state;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  return state;
+}
+
+test("the broker releases a disconnected client's threads unless another client still holds them", async () => {
+  const cwd = makeTempDir();
+  const bin = makeTempDir();
+  installFakeCodex(bin, "with-subagent");
+  const session = await ensureBrokerSession(cwd, { env: buildEnv(bin), timeoutMs: 5000 });
+  const first = await CodexAppServerClient.connect(cwd, { brokerEndpoint: session.endpoint });
+  const second = await CodexAppServerClient.connect(cwd, { brokerEndpoint: session.endpoint });
+  const shared = (await first.request("thread/start", { cwd })).thread.id;
+  const own = (await second.request("thread/start", { cwd })).thread.id;
+  await second.request("thread/resume", { threadId: shared, cwd });
+  const turnDone = new Promise(resolve => second.setNotificationHandler(message => {
+    if (message.method === "turn/completed" && message.params.threadId === own) resolve();
+  }));
+  await second.request("turn/start", { threadId: own, input: [{ type: "text", text: "spawn a child", text_elements: [] }] });
+  await turnDone;
+  const child = JSON.parse(fs.readFileSync(path.join(bin, "fake-codex-state.json"), "utf8")).threads.find(thread => thread.name === "design-challenger").id;
+  await first.close();
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(bin, "fake-codex-state.json"), "utf8")).unsubscribed ?? [], []);
+  await second.close();
+  const expected = [shared, own, child].sort();
+  const released = await waitForFakeState(bin, state => expected.every(id => (state.unsubscribed ?? []).includes(id)));
+  assert.deepEqual([...(released.unsubscribed ?? [])].sort(), expected);
+});

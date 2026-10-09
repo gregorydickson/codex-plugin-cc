@@ -85,6 +85,9 @@ const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const WORKER_VALUE_OPTIONS = ["output-schema", "result-file", "notify-socket", "mcp-config", "profile", "name", "brief", "instructions", "preread", "worktree", "lock-cmd", "unlock-cmd", "fanout", "on-start", "on-progress", "on-stop-report", "on-end", "on-fail"];
 const WORKER_BOOLEAN_OPTIONS = ["persistent", "pause-and-ask"];
+const WORKER_PATH_OPTIONS = ["output-schema", "result-file", "notify-socket", "mcp-config", "brief", "instructions", "preread", "worktree"];
+// Per-turn input: the resumed thread already holds the previous slice's brief and preread.
+const PER_TURN_WORKER_OPTIONS = ["brief", "preread"];
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -99,7 +102,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
-      "  node scripts/codex-companion.mjs sessions list|stop|resume [name] [--json]",
+      "  node scripts/codex-companion.mjs sessions list|stop|resume [name] [prompt] [worker options] [--json]",
       "  node scripts/codex-companion.mjs send <job|name> <message> [--json]",
       "  node scripts/codex-companion.mjs answer <job|name> <answer> [--file <path>] [--json]",
       "  node scripts/codex-companion.mjs compare --brief <file> --schema <file> --against <command> [--json]",
@@ -359,7 +362,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
 
   const trackedTask = findLatestResumableTaskJob(visibleJobs);
   if (trackedTask) {
-    return { id: trackedTask.threadId };
+    return { id: trackedTask.threadId, jobId: trackedTask.id };
   }
 
   if (sessionId) {
@@ -846,6 +849,16 @@ async function handleReview(argv) {
   });
 }
 
+function absoluteWorkerArgs(cwd, options) {
+  const args = {};
+  for (const key of [...WORKER_VALUE_OPTIONS, ...WORKER_BOOLEAN_OPTIONS, "write"]) {
+    const value = options[key];
+    if (value == null || value === false) continue;
+    args[key] = !WORKER_PATH_OPTIONS.includes(key) ? value : Array.isArray(value) ? value.map(file => path.resolve(cwd, file)) : path.resolve(cwd, value);
+  }
+  return args;
+}
+
 async function prepareWorkerOptions(cwd, options) {
   const runtime = await resolveRuntimeOptions(cwd, { mcpConfig: options["mcp-config"], profile: options.profile, write: Boolean(options.write), ...(options.fanout != null ? { fanout: options.fanout } : {}) });
   const context = readWorkerContext(cwd, options);
@@ -857,6 +870,8 @@ async function prepareWorkerOptions(cwd, options) {
   return {
     ...runtime,
     ...context,
+    developerInstructions: [context.developerInstructions, options["pause-and-ask"] ? STOP_REPORT_INSTRUCTIONS : ""].filter(Boolean).join("\n\n"),
+    workerArgs: { ...absoluteWorkerArgs(cwd, options), ...(options.worktree ? { worktree: cwd } : {}) },
     outputSchema,
     resultFile: options["result-file"] ? path.resolve(cwd, options["result-file"]) : null,
     notifySocket: options["notify-socket"] ? path.resolve(cwd, options["notify-socket"]) : null,
@@ -890,13 +905,17 @@ async function handleTask(argv) {
   });
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const resumeLast = Boolean(options["resume-last"] || options.resume);
+  if (resumeLast && options.fresh) throw new Error("Choose either --resume/--resume-last or --fresh.");
+  if (resumeLast) {
+    const latest = await resolveLatestTrackedTaskThread(cwd);
+    const previous = latest?.jobId ? readStoredJob(workspaceRoot, latest.jobId) : null;
+    if (previous?.request) return resumeSession(previous, readTaskPrompt(cwd, options, positionals) || DEFAULT_CONTINUE_PROMPT, { ...options, overrideCwd: cwd });
+  }
   const worker = await prepareWorkerOptions(cwd, options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
   const prompt = [readTaskPrompt(cwd, options, positionals), worker.briefText, worker.inputContext].filter(Boolean).join("\n\n");
-  if (worker.pauseAndAsk) worker.developerInstructions = [worker.developerInstructions, STOP_REPORT_INSTRUCTIONS].filter(Boolean).join("\n\n");
-  const resumeLast = Boolean(options["resume-last"] || options.resume);
-  if (resumeLast && options.fresh) throw new Error("Choose either --resume/--resume-last or --fresh.");
   requireTaskRequest(prompt, resumeLast);
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({ prompt, resumeLast });
@@ -1137,7 +1156,12 @@ function selectedSession(cwd, reference) {
 }
 
 async function handleSessions(argv) {
-  const { options, positionals } = parseCommandInput(argv, { valueOptions: ["cwd", "prompt-file"], booleanOptions: ["json", "background"] });
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "prompt-file", "model", "effort", ...WORKER_VALUE_OPTIONS],
+    repeatedOptions: ["instructions", "preread"],
+    booleanOptions: ["json", "background", "write", ...WORKER_BOOLEAN_OPTIONS],
+    aliasMap: { m: "model" }
+  });
   const cwd = resolveCommandCwd(options);
   const [action = "list", reference, ...words] = positionals;
   for (const root of new Set(listJobsAcrossWorktrees(cwd).map(job => job.workspaceRoot))) await reconcileOrphanedJobs(root);
@@ -1156,7 +1180,35 @@ async function handleSessions(argv) {
   }
   if (action !== "resume") throw new Error("Use sessions list, stop, or resume.");
   const prompt = readTaskPrompt(cwd, options, words) || DEFAULT_CONTINUE_PROMPT;
-  return resumeSession(job, prompt, options);
+  return resumeSession(job, prompt, { ...options, overrideCwd: cwd, structured: true });
+}
+
+/**
+ * The single place a continued job's options are rebuilt from the job it continues.
+ * An answer is the same job and keeps its request verbatim. A new turn replays the
+ * recorded worker arguments minus per-turn input; explicit flags win. A literal
+ * result file belongs to the job that wrote it, while a {jobId} pattern carries over.
+ */
+async function resumedRequest(previous, options) {
+  const base = previous.request;
+  if (options.answering) return { request: base, worker: {} };
+  const explicit = absoluteWorkerArgs(options.overrideCwd ?? base.cwd, options);
+  if (options.worktree) explicit.worktree = options.overrideCwd;
+  for (const key of ["name", "persistent"]) if (explicit[key]) throw new Error(`--${key} cannot change on resume; the session keeps its name.`);
+  const recorded = base.workerArgs;
+  if (explicit.worktree && explicit.worktree !== (recorded?.worktree ?? null)) throw new Error("A resumed session keeps its original worktree.");
+  if (!recorded) {
+    // Records written before worker arguments were kept: replay the stored request, minus its result file.
+    if (Object.keys(explicit).some(key => key !== "worktree") || options.model || options.effort) throw new Error("This session predates resume overrides; resume it without option flags.");
+    return { request: { ...base, resultFile: null }, worker: { resultFile: null } };
+  }
+  const inherited = Object.fromEntries(Object.entries(recorded).filter(([key, value]) =>
+    !PER_TURN_WORKER_OPTIONS.includes(key) && (key !== "result-file" || value.includes("{jobId}"))));
+  const worker = await prepareWorkerOptions(base.cwd, { ...inherited, ...explicit });
+  const model = options.model ? normalizeRequestedModel(options.model) : base.model;
+  const effort = options.effort ? normalizeReasoningEffort(options.effort) : base.effort;
+  const write = Boolean(inherited.write || explicit.write);
+  return { request: { ...base, ...worker, model, effort, write }, worker: { ...worker, model, effort, write } };
 }
 
 async function resumeSession(previous, prompt, options = {}) {
@@ -1164,14 +1216,17 @@ async function resumeSession(previous, prompt, options = {}) {
   if (!previous.threadId || !previous.request) throw new Error("Session has no resumable thread.");
   const workspaceRoot = previous.workspaceRoot;
   options = { ...options, answering: options.answering || previous.status === "awaiting-answer" };
+  const resumed = await resumedRequest(previous, options);
+  if (!options.answering) prompt = [prompt, resumed.worker.briefText, resumed.worker.inputContext].filter(Boolean).join("\n\n");
   // Each turn gets a fresh job id and terminal-delivery record; the name follows the latest turn.
-  const job = { ...previous, id: options.answering ? previous.id : generateJobId("task"), createdAt: nowIso(), status: "queued", threadId: previous.threadId,
+  const job = { ...previous, ...resumed.worker, id: options.answering ? previous.id : generateJobId("task"), createdAt: nowIso(), status: "queued", threadId: previous.threadId,
     pid: null, workerPid: null, watchdogPid: null, completedAt: null, result: null, rendered: null, errorMessage: null, errorCode: null,
     schemaValid: null, parseError: null, lockAcquired: false, logFile: null, changedFilesBefore: null,
     changedFiles: options.answering ? previous.changedFiles : [], externalLock: null, finalization: null, terminalDelivery: null, pauseDelivery: null, changedFilesError: options.answering ? previous.changedFilesError : null,
     resumedFrom: options.answering ? previous.resumedFrom : previous.id, resumedTo: null,
-    deliveryErrors: null, unlockError: null, usage: null, startedAt: null, cancelledAt: null, cancelRequested: false, structured: true };
-  const request = { ...previous.request, resumeLast: false, resumeThreadId: previous.threadId, prompt, jobId: job.id };
+    deliveryErrors: null, unlockError: null, usage: null, startedAt: null, cancelledAt: null, cancelRequested: false,
+    structured: options.structured || options.answering || Boolean(resumed.worker.structured ?? previous.structured) };
+  const request = { ...resumed.request, resumeLast: false, resumeThreadId: previous.threadId, prompt, jobId: job.id };
   job.request = request;
   withFileLockSync(path.join(resolveStateDir(workspaceRoot), "sessions.lock"), () => withFileLockSync(`${resolveJobFile(workspaceRoot, previous.id)}.lock`, () => {
     const latest = readStoredJob(workspaceRoot, previous.id);
@@ -1199,7 +1254,7 @@ async function handleAnswer(argv) {
   if (job.status !== "awaiting-answer") throw new Error("Job is not awaiting an answer.");
   const answer = options.file ? fs.readFileSync(path.resolve(cwd, options.file), "utf8") : words.join(" ");
   if (!answer.trim()) throw new Error("Provide an answer or --file.");
-  return resumeSession(job, `Answer to your stop report:\n${answer}\nContinue the original brief on this thread.`, { ...options, answering: true });
+  return resumeSession(job, `Answer to your stop report:\n${answer}\nContinue the original brief on this thread.`, { ...options, answering: true, structured: true });
 }
 
 async function handleSend(argv) {

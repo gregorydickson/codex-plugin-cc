@@ -49,6 +49,11 @@ export function resultEnvelope(job) {
   };
 }
 
+// A {jobId} placeholder lets one --result-file pattern serve every turn of a session.
+export function resultFilePath(job) {
+  return job.resultFile ? job.resultFile.replaceAll("{jobId}", job.id) : null;
+}
+
 export function atomicWriteJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
